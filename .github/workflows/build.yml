@@ -39,8 +39,8 @@ jobs:
                   applicationId = "com.example.aimline"
                   minSdk = 30
                   targetSdk = 34
-                  versionCode = 4
-                  versionName = "3.0"
+                  versionCode = 5
+                  versionName = "3.1"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -140,7 +140,7 @@ jobs:
                   }
 
                   col.addView(TextView(this).apply {
-                      text = "Aim Line v3.0"
+                      text = "Aim Line v3.1"
                       textSize = 20f
                   })
 
@@ -781,7 +781,7 @@ jobs:
                   for (int i = 0; i < r.starCount; i++) {
                       double sx = r.stars[2 * i], sy = r.stars[2 * i + 1];
                       double dist = Math.hypot(x - sx, y - sy);
-                      if (dist < 0.45 * r0 || dist > 2.4 * r0) continue;
+                      if (dist < 0.5 * r0 || dist > 2.0 * r0) continue;
                       double err = tangentErr(thFly, Math.atan2(y - sy, x - sx));
                       if (err > 0.6) continue;
                       if (err < best) { best = err; cur = i; bestDist = dist; }
@@ -805,6 +805,7 @@ jobs:
               }
 
               private void followOrbit(double tc, Detector.Result r) {
+                  if (!haveFit && tc - orbitStartT > 1200) { endOrbit(tc); return; }     // false start: give up and look again
                   // is the sprite still on the circle?
                   boolean bad;
                   if (haveFit) {
@@ -930,7 +931,7 @@ jobs:
                           return;
                       }
                   }
-                  if (Math.abs(slope) < 0.5 || Math.abs(slope) > 14) return;
+                  if (Math.abs(slope) < 1.2 || Math.abs(slope) > 10) return;
                   double rs = 0;
                   int rc = 0;
                   for (int i = 0; i < n; i++) {
@@ -940,6 +941,7 @@ jobs:
                   }
                   if (rc < 5) return;
                   double R = rs / rc;
+                  if (R < 0.5 * r0 || R > 2.0 * r0) return;
 
                   double phiNow = wrap(icpt);
                   boolean reset = !haveFit || (slope > 0) != (oOm > 0);
@@ -1427,21 +1429,46 @@ jobs:
 
               /** Plain-language reading of the log: how the speed changes with the radius. */
               fun summary(c: Context): String {
-                  val d = rows(c).mapNotNull { row ->
+                  val all = rows(c).mapNotNull { row ->
                       val p = row.split(",")
                       if (p.size < 5) null else doubleArrayOf(p[1].toDouble(), abs(p[2].toDouble()), p[3].toDouble())
                   }
-                  if (d.size < 3) return "Circles logged: ${d.size}. Play a few more (ideally of different sizes)."
+                  if (all.size < 3) return "Circles logged: ${all.size}. Play a few more (ideally of different sizes)."
+                  // one odd record (a false circle) must not decide the result: drop sizes far from the typical one
+                  val med = all.map { it[0] }.sorted()[all.size / 2]
+                  val d = all.filter { it[0] > 0.5 * med && it[0] < 2.0 * med }
+                  val skipped = all.size - d.size
                   val rMin = d.minOf { it[0] }
                   val rMax = d.maxOf { it[0] }
-                  val head = String.format(Locale.US, "Circles logged: %d, radius %.1f-%.1f%% of width.", d.size, rMin, rMax)
-                  if (rMax / rMin < 1.15) return "$head\nAll circles are about the same size, so there is nothing to compare yet."
+                  val oMin = d.minOf { it[1] }
+                  val oMax = d.maxOf { it[1] }
+                  val oAvg = d.map { it[1] }.average()
+                  val extra = if (skipped > 0) " (+$skipped odd ones ignored)" else ""
+                  val head = String.format(
+                      Locale.US, "Circles logged: %d%s, radius %.1f-%.1f%% of width, turn rate %.2f-%.2f rad/s (avg %.2f).",
+                      d.size, extra, rMin, rMax, oMin, oMax, oAvg
+                  )
+                  val n = d.size.toDouble()
+                  if (rMax / rMin < 1.6) {
+                      val mr = d.map { it[0] }.average()
+                      var cov = 0.0; var vr = 0.0; var vo = 0.0
+                      for (v in d) {
+                          cov += (v[0] - mr) * (v[1] - oAvg)
+                          vr += (v[0] - mr) * (v[0] - mr)
+                          vo += (v[1] - oAvg) * (v[1] - oAvg)
+                      }
+                      val corr = if (vr > 0 && vo > 0) cov / Math.sqrt(vr * vo) else 0.0
+                      return String.format(
+                          Locale.US,
+                          "%s\nAll circles are about the same size, so size does not explain the speed changes (correlation %.2f).",
+                          head, corr
+                      )
+                  }
                   var sx = 0.0; var sy = 0.0; var sxx = 0.0; var sxy = 0.0
                   for (v in d) {
                       val x = ln(v[0]); val y = ln(v[1])
                       sx += x; sy += y; sxx += x * x; sxy += x * y
                   }
-                  val n = d.size.toDouble()
                   val a = (n * sxy - sx * sy) / (n * sxx - sx * sx)
                   val k = exp((sy - a * sx) / n)
                   val meaning = when {
