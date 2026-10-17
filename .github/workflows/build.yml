@@ -39,8 +39,8 @@ jobs:
                   applicationId = "com.example.aimline"
                   minSdk = 30
                   targetSdk = 34
-                  versionCode = 2
-                  versionName = "2.0"
+                  versionCode = 3
+                  versionName = "2.1"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -135,6 +135,11 @@ jobs:
                       setPadding(48, 120, 48, 48)
                   }
 
+                  col.addView(TextView(this).apply {
+                      text = "Aim Line v2.1"
+                      textSize = 20f
+                  })
+
                   fun button(label: String, action: () -> Unit) {
                       col.addView(Button(this).apply {
                           text = label
@@ -186,7 +191,7 @@ jobs:
                       text = "Tuning"
                       textSize = 18f
                   })
-                  slider(col, prefs, "Line lead (raise if the line lags behind the sprite)", "lead", 0, 150, 60, " ms")
+                  slider(col, prefs, "Line lead (raise if the line lags behind the sprite)", "lead", 0, 150, 65, " ms")
                   slider(col, prefs, "Tap lead (raise if taps land late, lower if early)", "taplead", 0, 250, 110, " ms")
                   slider(col, prefs, "Angle trim (only if the line is always rotated the same way)", "trim", -15, 15, 0, "\u00B0")
 
@@ -523,34 +528,50 @@ jobs:
            * Turns noisy per-frame detections into (1) a smooth, latency-compensated aim line and
            * (2) an "aimed at the next circle" decision for the auto-tap. Pure Java, no Android classes.
            *
-           * All positions are in capture-frame pixels.
+           * While the sprite circles a star, a circle is fitted to the last second of motion
+           * (constant angular speed, facing along the tangent). The line is then drawn from that fitted
+           * path instead of from single noisy frames, so it does not shake. Outside an orbit a plain
+           * alpha-beta filter is used.
+           *
+           * All positions are in capture-frame pixels; all times are in milliseconds.
            */
           public final class AimEngine {
 
-              /** Immutable-ish state handed to the overlay view; it extrapolates it on every screen refresh. */
+              /** State handed to the overlay view, which evaluates it on every screen refresh. */
               public static final class Snapshot {
-                  public long t;                       // uptime ms of the detection this state belongs to
-                  public boolean visible, locked;
-                  public float x, y, theta, vx, vy, omega, tip;
-                  public float tx, ty, tr;             // aimed-at star (valid when locked)
+                  public double t;                     // capture time (uptime clock) this state belongs to
+                  public boolean visible, locked, orbit;
+                  public float x, y, theta, vx, vy, omega, tip;      // alpha-beta state (used when not orbiting)
+                  public float tx, ty, tr;                           // aimed-at star (valid when locked)
+                  public float ocx, ocy, oR, oPhi, oOmega, oDelta, oSign;   // fitted orbit (valid when orbit)
 
                   public Snapshot scaled(float fx, float fy) {
                       Snapshot s = new Snapshot();
-                      s.t = t; s.visible = visible; s.locked = locked;
+                      s.t = t; s.visible = visible; s.locked = locked; s.orbit = orbit;
                       s.x = x * fx; s.y = y * fy; s.theta = theta;
                       s.vx = vx * fx; s.vy = vy * fy; s.omega = omega;
                       s.tip = tip * fx; s.tx = tx * fx; s.ty = ty * fy; s.tr = tr * fx;
+                      s.ocx = ocx * fx; s.ocy = ocy * fy; s.oR = oR * fx;
+                      s.oPhi = oPhi; s.oOmega = oOmega; s.oDelta = oDelta; s.oSign = oSign;
                       return s;
                   }
 
+                  /** Position and facing angle at time now (+ lead). out = {x, y, theta}. */
                   public void at(long now, float leadMs, float[] out) {
-                      float dt = (now - t) + leadMs;
+                      float dt = (float) ((now - t) + leadMs);
                       if (dt < 0) dt = 0;
                       if (dt > 250) dt = 250;
                       dt /= 1000f;
-                      out[0] = x + vx * dt;
-                      out[1] = y + vy * dt;
-                      out[2] = theta + omega * dt;
+                      if (orbit) {
+                          float phi = oPhi + oOmega * dt;
+                          out[0] = ocx + oR * (float) Math.cos(phi);
+                          out[1] = ocy + oR * (float) Math.sin(phi);
+                          out[2] = phi + oSign * (float) (Math.PI / 2) + oDelta;
+                      } else {
+                          out[0] = x + vx * dt;
+                          out[1] = y + vy * dt;
+                          out[2] = theta + omega * dt;
+                      }
                   }
               }
 
@@ -558,25 +579,49 @@ jobs:
               public float tapLeadMs = 110f;
               public float trimDeg = 0f;
               public boolean autoTap = false;
+              public boolean orbitFit = true;      // false = plain filter only (kept for testing)
 
               /** Set by update(): true on the one frame where a tap should be sent. */
               public boolean fire = false;
 
               private static final double HALF_PI = Math.PI / 2;
-              private static final long COOLDOWN_MS = 800;
-              private static final double HIT_K = 0.55;     // ray must pass within this fraction of the radius of the target centre
+              private static final double COOLDOWN_MS = 800;
+              private static final double HIT_K = 0.55;
+              private static final double WINDOW_MS = 1000;
+              private static final int CAP = 64;
 
               private final int w;
               private final double r0;
               private double orbitR;
 
+              // alpha-beta state
               private boolean has;
-              private long tLast, tSeen, tFire;
+              private double tLast, tSeen, tFire = -1e9;
               private double x, y, vx, vy, th, om, tip;
-              private int flip, orbitRun;
+              private int flip;
               private boolean lastInnovationOk;
               private double dtFrame = 0.033;
-              private boolean orbiting, locked;
+
+              // capture-time clock
+              private long lastTsNs;
+              private double tsOffset;
+              private boolean haveOffset;
+
+              // orbit session
+              private boolean orbitActive;
+              private int orbitRun, orbitMiss;
+              private double ocx, ocy;
+              private double phiPrev, phiUnw;
+              private final double[] bt = new double[CAP], bphi = new double[CAP], bth = new double[CAP];
+              private final double[] bx = new double[CAP], by = new double[CAP], tphi = new double[CAP];
+              private final double[] cf = new double[3];
+              private double fitCx, fitCy;
+              private final boolean[] keep = new boolean[CAP];
+              private int n;
+              private boolean fitValid;
+              private double fitPhi, fitOm, fitR, fitDelta, fitS;
+
+              private boolean locked;
               private float tx, ty;
 
               public AimEngine(int frameWidth) {
@@ -591,29 +636,46 @@ jobs:
                   return a;
               }
 
-              public Snapshot update(long now, Detector.Result r) {
+              /**
+               * Frame capture time on the uptime clock. Uses the image's own timestamp (steady) and only
+               * borrows the arrival clock for the offset, so uneven delivery does not look like motion.
+               */
+              private double captureTime(long arrivalMs, long tsNs) {
+                  if (tsNs <= 0 || tsNs <= lastTsNs) return arrivalMs;
+                  double tsMs = tsNs / 1e6;
+                  double sample = arrivalMs - tsMs;
+                  if (!haveOffset) { tsOffset = sample; haveOffset = true; }
+                  else if (sample < tsOffset) tsOffset = sample;
+                  else tsOffset += 0.01 * (sample - tsOffset);
+                  lastTsNs = tsNs;
+                  return tsMs + tsOffset;
+              }
+
+              public Snapshot update(long arrivalMs, long tsNs, Detector.Result r) {
                   fire = false;
+                  double tc = captureTime(arrivalMs, tsNs);
                   if (r == null) {
-                      if (has && now - tSeen > 300) { has = false; orbitRun = 0; }
+                      if (has && tc - tSeen > 300) { has = false; endOrbit(); }
                       locked = false;
                       return snapshot();
                   }
-                  double dt = has ? (now - tLast) / 1000.0 : 0;
-                  if (has && dt > 0.25) has = false;
+                  double dt = has ? (tc - tLast) / 1000.0 : 0;
+                  if (has && (dt > 0.25 || dt < 0)) { has = false; endOrbit(); }
                   double z = r.angle + Math.toRadians(trimDeg);
+                  double measTheta = Double.NaN;
                   lastInnovationOk = false;
 
                   if (!has) {
                       x = r.x; y = r.y; vx = 0; vy = 0;
                       th = z; om = 0; tip = r.tip;
-                      flip = 0; orbitRun = 0;
+                      flip = 0;
                       has = true;
+                      measTheta = z;
                   } else {
                       if (dt < 0.004) dt = 0.004;
                       dtFrame = Math.min(0.1, Math.max(0.016, dt));
                       double px = x + vx * dt, py = y + vy * dt, pth = th + om * dt;
 
-                      // position: alpha-beta filter
                       double ex = r.x - px, ey = r.y - py;
                       double e = Math.hypot(ex, ey);
                       if (e > 0.15 * w) {
@@ -627,7 +689,6 @@ jobs:
                           vy += b * ey / dt;
                       }
 
-                      // angle: alpha-beta filter on the unwrapped angle
                       double d = wrap(z - pth);
                       boolean accept = true;
                       if (Math.abs(d) > 1.75) {
@@ -642,6 +703,7 @@ jobs:
                           flip = 0;
                       }
                       if (accept) {
+                          measTheta = pth + d;
                           boolean big = Math.abs(d) > 0.12;
                           double a = big ? 0.8 : 0.35, b = big ? 0.3 : 0.07;
                           th = pth + a * d;
@@ -653,62 +715,241 @@ jobs:
                           th = pth;
                       }
                       th = wrap(th);
-                      tip += 0.2 * (r.tip - tip);
+                      tip += 0.05 * (r.tip - tip);       // slow: a jittery start point would make the dots shimmer
                   }
-                  tLast = now;
-                  tSeen = now;
+                  tLast = tc;
+                  tSeen = tc;
 
-                  findOrbitAndTarget(now, r);
+                  updateOrbit(tc, r, measTheta);
+                  findTarget(tc, r);
                   return snapshot();
               }
 
-              private void findOrbitAndTarget(long now, Detector.Result r) {
-                  orbiting = false;
-                  locked = false;
-                  int cur = -1;
-                  double bestScore = 1e9, curDist = 0;
-                  for (int i = 0; i < r.starCount; i++) {
-                      double sx = r.stars[2 * i], sy = r.stars[2 * i + 1];
-                      double dist = Math.hypot(x - sx, y - sy);
-                      if (dist < 0.65 * orbitR || dist > 1.45 * orbitR) continue;
-                      double ang = Math.atan2(y - sy, x - sx);
-                      double err = Math.min(Math.abs(wrap(th - (ang + HALF_PI))), Math.abs(wrap(th - (ang - HALF_PI))));
-                      if (err > 0.65) continue;     // the sprite faces along the orbit tangent when it is orbiting
-                      double score = err + Math.abs(dist - orbitR) / orbitR;
-                      if (score < bestScore) { bestScore = score; cur = i; curDist = dist; }
+              private static double tangentErr(double facing, double radial) {
+                  return Math.min(Math.abs(wrap(facing - (radial + HALF_PI))), Math.abs(wrap(facing - (radial - HALF_PI))));
+              }
+
+              private void endOrbit() {
+                  orbitActive = false;
+                  fitValid = false;
+                  orbitRun = 0;
+                  orbitMiss = 0;
+                  n = 0;
+              }
+
+              private void updateOrbit(double tc, Detector.Result r, double measTheta) {
+                  if (orbitActive) {
+                      // keep the centre fresh using the detection of the same star
+                      int bi = -1;
+                      double bdist = 0.35 * orbitR;
+                      for (int i = 0; i < r.starCount; i++) {
+                          double d = Math.hypot(r.stars[2 * i] - ocx, r.stars[2 * i + 1] - ocy);
+                          if (d < bdist) { bdist = d; bi = i; }
+                      }
+                      if (bi >= 0) {
+                          ocx += 0.1 * (r.stars[2 * bi] - ocx);
+                          ocy += 0.1 * (r.stars[2 * bi + 1] - ocy);
+                      }
+                      double dist = Math.hypot(r.x - ocx, r.y - ocy);
+                      double err = tangentErr(th, Math.atan2(r.y - ocy, r.x - ocx));
+                      if (dist < 0.6 * orbitR || dist > 1.6 * orbitR || err > 0.8) {
+                          if (++orbitMiss >= 3) endOrbit();
+                      } else {
+                          orbitMiss = 0;
+                      }
+                  } else {
+                      int cur = -1;
+                      double bestScore = 1e9;
+                      for (int i = 0; i < r.starCount; i++) {
+                          double sx = r.stars[2 * i], sy = r.stars[2 * i + 1];
+                          double dist = Math.hypot(x - sx, y - sy);
+                          if (dist < 0.65 * orbitR || dist > 1.45 * orbitR) continue;
+                          double err = tangentErr(th, Math.atan2(y - sy, x - sx));
+                          if (err > 0.65) continue;     // the sprite faces along the orbit tangent when it is orbiting
+                          double score = err + Math.abs(dist - orbitR) / orbitR;
+                          if (score < bestScore) { bestScore = score; cur = i; }
+                      }
+                      if (cur < 0) { orbitRun = 0; return; }
+                      if (++orbitRun >= 4) {
+                          orbitActive = true;
+                          orbitMiss = 0;
+                          ocx = r.stars[2 * cur];
+                          ocy = r.stars[2 * cur + 1];
+                          n = 0;
+                          fitValid = false;
+                      }
                   }
-                  if (cur < 0) { orbitRun = 0; return; }
-                  orbiting = true;
-                  orbitRun++;
-                  orbitR += 0.03 * (curDist - orbitR);
+                  if (!orbitActive) return;
+                  addSample(tc, r, measTheta);
+                  fit(tc);
+              }
+
+              private void addSample(double tc, Detector.Result r, double measTheta) {
+                  double phi = Math.atan2(r.y - ocy, r.x - ocx);
+                  if (n == 0) phiUnw = phi; else phiUnw += wrap(phi - phiPrev);
+                  phiPrev = phi;
+                  int drop = 0;
+                  while (drop < n && tc - bt[drop] > WINDOW_MS) drop++;
+                  if (n - drop >= CAP) drop = n - CAP + 1;
+                  if (drop > 0) {
+                      System.arraycopy(bt, drop, bt, 0, n - drop);
+                      System.arraycopy(bphi, drop, bphi, 0, n - drop);
+                      System.arraycopy(bth, drop, bth, 0, n - drop);
+                      System.arraycopy(bx, drop, bx, 0, n - drop);
+                      System.arraycopy(by, drop, by, 0, n - drop);
+                      n -= drop;
+                  }
+                  bt[n] = tc;
+                  bphi[n] = phiUnw;
+                  bth[n] = measTheta;
+                  bx[n] = r.x;
+                  by[n] = r.y;
+                  n++;
+              }
+
+              /** Least-squares line through the unwrapped orbit angle: slope = angular speed. */
+              private void fit(double tc) {
+                  fitValid = false;
+                  if (!orbitFit || n < 6 || bt[n - 1] - bt[0] < 150) return;
+
+                  // Centre of the path: fit a circle to the sprite's own positions when it has gone far enough
+                  // around (a star-centre detection can be a few pixels off, which would bend the fit).
+                  double cx = ocx, cy = ocy;
+                  if (Math.abs(bphi[n - 1] - bphi[0]) > 1.8 && circleFit(cf)) {
+                      if (Math.hypot(cf[0] - ocx, cf[1] - ocy) < 0.4 * orbitR && cf[2] > 0.7 * orbitR && cf[2] < 1.3 * orbitR) {
+                          cx = cf[0];
+                          cy = cf[1];
+                      }
+                  }
+                  double prevA = 0;
+                  for (int i = 0; i < n; i++) {
+                      double a = Math.atan2(by[i] - cy, bx[i] - cx);
+                      tphi[i] = i == 0 ? a : tphi[i - 1] + wrap(a - prevA);
+                      prevA = a;
+                  }
+                  for (int i = 0; i < n; i++) keep[i] = true;
+                  double slope = 0, icpt = 0;
+                  for (int pass = 0; pass < 2; pass++) {
+                      double cnt = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
+                      for (int i = 0; i < n; i++) {
+                          if (!keep[i]) continue;
+                          double xx = (bt[i] - tc) / 1000.0;
+                          cnt++; sx += xx; sy += tphi[i]; sxx += xx * xx; sxy += xx * tphi[i];
+                      }
+                      double den = cnt * sxx - sx * sx;
+                      if (cnt < 5 || den < 1e-9) return;
+                      slope = (cnt * sxy - sx * sy) / den;
+                      icpt = (sy - slope * sx) / cnt;
+                      double ss = 0;
+                      for (int i = 0; i < n; i++) {
+                          if (!keep[i]) continue;
+                          double res = tphi[i] - (icpt + slope * (bt[i] - tc) / 1000.0);
+                          ss += res * res;
+                      }
+                      double rms = Math.sqrt(ss / cnt);
+                      if (pass == 0) {
+                          double thr = Math.max(2.5 * rms, 0.04);       // drop outliers once, then refit
+                          for (int i = 0; i < n; i++) {
+                              double res = tphi[i] - (icpt + slope * (bt[i] - tc) / 1000.0);
+                              if (Math.abs(res) > thr) keep[i] = false;
+                          }
+                      } else if (rms > 0.12) {
+                          return;
+                      }
+                  }
+                  if (Math.abs(slope) < 0.8 || Math.abs(slope) > 12) return;
+                  double s = slope > 0 ? 1 : -1;
+                  double rs = 0, sn = 0, cs = 0;
+                  int rc = 0, dc = 0;
+                  for (int i = 0; i < n; i++) {
+                      if (!keep[i]) continue;
+                      rs += Math.hypot(bx[i] - cx, by[i] - cy); rc++;
+                      if (!Double.isNaN(bth[i])) {
+                          double dlt = wrap(bth[i] - s * HALF_PI - (icpt + slope * (bt[i] - tc) / 1000.0));
+                          sn += Math.sin(dlt); cs += Math.cos(dlt); dc++;
+                      }
+                  }
+                  if (rc < 5) return;
+                  fitR = rs / rc;
+                  fitCx = cx;
+                  fitCy = cy;
+                  fitDelta = dc >= 3 ? Math.atan2(sn, cs) : 0;     // averaged facing-vs-tangent offset (also absorbs star-centre error)
+                  fitPhi = wrap(icpt);
+                  fitOm = slope;
+                  fitS = s;
+                  fitValid = true;
+                  orbitR += 0.1 * (fitR - orbitR);
                   if (orbitR < 0.8 * r0) orbitR = 0.8 * r0;
                   if (orbitR > 1.2 * r0) orbitR = 1.2 * r0;
+              }
 
-                  // where will the sprite be, and which way will it face, when the tap actually lands?
-                  double L = tapLeadMs / 1000.0;
-                  double fx = x + vx * L, fy = y + vy * L, fth = th + om * L;
+              /** Algebraic least-squares circle through the stored sprite positions. out = {cx, cy, radius}. */
+              private boolean circleFit(double[] out) {
+                  double mx = 0, my = 0;
+                  for (int i = 0; i < n; i++) { mx += bx[i]; my += by[i]; }
+                  mx /= n; my /= n;
+                  double suu = 0, svv = 0, suv = 0, suuu = 0, svvv = 0, suvv = 0, svuu = 0;
+                  for (int i = 0; i < n; i++) {
+                      double u = bx[i] - mx, v = by[i] - my;
+                      suu += u * u; svv += v * v; suv += u * v;
+                      suuu += u * u * u; svvv += v * v * v; suvv += u * v * v; svuu += v * u * u;
+                  }
+                  double det = suu * svv - suv * suv;
+                  if (Math.abs(det) < 1e-6) return false;
+                  double b1 = 0.5 * (suuu + suvv), b2 = 0.5 * (svvv + svuu);
+                  double uc = (b1 * svv - b2 * suv) / det;
+                  double vc = (suu * b2 - suv * b1) / det;
+                  out[0] = mx + uc;
+                  out[1] = my + vc;
+                  out[2] = Math.sqrt(uc * uc + vc * vc + (suu + svv) / n);
+                  return true;
+              }
+
+              /** Where the sprite will be, and which way it will face, leadS seconds after the latest frame. */
+              private void predict(double leadS, double[] o) {
+                  if (fitValid) {
+                      double p = fitPhi + fitOm * leadS;
+                      o[0] = fitCx + fitR * Math.cos(p);
+                      o[1] = fitCy + fitR * Math.sin(p);
+                      o[2] = p + fitS * HALF_PI + fitDelta;
+                  } else {
+                      o[0] = x + vx * leadS;
+                      o[1] = y + vy * leadS;
+                      o[2] = th + om * leadS;
+                  }
+              }
+
+              private final double[] pred = new double[3];
+
+              private void findTarget(double tc, Detector.Result r) {
+                  locked = false;
+                  if (!orbitActive) return;
+                  predict(tapLeadMs / 1000.0, pred);
+                  double fx = pred[0], fy = pred[1], fth = pred[2];
                   double ux = Math.cos(fth), uy = Math.sin(fth);
-                  double curY = r.stars[2 * cur + 1];
+                  double om2 = fitValid ? fitOm : om;
                   int hit = -1;
                   double hitT = 1e18, hitD = 0, hitEps = 0;
                   for (int j = 0; j < r.starCount; j++) {
-                      if (j == cur) continue;
-                      double rx = r.stars[2 * j] - fx, ry = r.stars[2 * j + 1] - fy;
+                      double sx = r.stars[2 * j], sy = r.stars[2 * j + 1];
+                      if (Math.hypot(sx - ocx, sy - ocy) < 0.5 * orbitR) continue;      // the star we are circling
+                      double rx = sx - fx, ry = sy - fy;
                       double t = rx * ux + ry * uy;
                       if (t < 0.5 * orbitR) continue;
                       double d = Math.abs(rx * uy - ry * ux);
                       if (d < 0.95 * orbitR && t < hitT) { hit = j; hitT = t; hitD = d; hitEps = wrap(Math.atan2(ry, rx) - fth); }
                   }
-                  if (hit >= 0 && hitD < HIT_K * orbitR && r.stars[2 * hit + 1] < curY - 0.3 * orbitR) {
+                  if (hit >= 0 && hitD < HIT_K * orbitR && r.stars[2 * hit + 1] < ocy - 0.3 * orbitR) {
                       locked = true;
                       tx = r.stars[2 * hit];
                       ty = r.stars[2 * hit + 1];
                   }
                   // tap when the line is closest to the middle of the target: within half a frame step of crossing it
-                  boolean centred = locked && Math.abs(hitEps) <= Math.max(0.5 * Math.abs(om) * dtFrame, 0.03);
-                  if (centred && autoTap && orbitRun >= 4 && lastInnovationOk && now - tFire > COOLDOWN_MS) {
+                  boolean centred = locked && Math.abs(hitEps) <= Math.max(0.5 * Math.abs(om2) * dtFrame, 0.03);
+                  boolean steady = fitValid || lastInnovationOk;
+                  if (centred && autoTap && steady && tc - tFire > COOLDOWN_MS) {
                       fire = true;
-                      tFire = now;
+                      tFire = tc;
                   }
               }
 
@@ -721,6 +962,12 @@ jobs:
                   s.vx = (float) vx; s.vy = (float) vy; s.omega = (float) om;
                   s.tip = (float) tip;
                   s.tx = tx; s.ty = ty; s.tr = (float) orbitR;
+                  if (orbitActive && fitValid) {
+                      s.orbit = true;
+                      s.ocx = (float) fitCx; s.ocy = (float) fitCy; s.oR = (float) fitR;
+                      s.oPhi = (float) fitPhi; s.oOmega = (float) fitOm;
+                      s.oDelta = (float) fitDelta; s.oSign = (float) fitS;
+                  }
                   return s;
               }
           }
@@ -745,7 +992,7 @@ jobs:
            */
           class LineView(context: Context) : View(context) {
               @Volatile var snap: AimEngine.Snapshot? = null
-              @Volatile var leadMs = 60f
+              @Volatile var leadMs = 65f
 
               private val pos = FloatArray(3)
               private val loc = IntArray(2)
@@ -953,10 +1200,10 @@ jobs:
                           engine.autoTap = prefs.getBoolean("auto", false)
                           engine.tapLeadMs = prefs.getInt("taplead", 110).toFloat()
                           engine.trimDeg = prefs.getInt("trim", 0).toFloat()
-                          view.leadMs = prefs.getInt("lead", 60).toFloat()
+                          view.leadMs = prefs.getInt("lead", 65).toFloat()
 
                           val res = detector.detect(bytes, plane.rowStride)
-                          view.snap = engine.update(now, res).scaled(fx, fy)
+                          view.snap = engine.update(now, image.timestamp, res).scaled(fx, fy)
                           if (engine.fire) {
                               TapService.instance?.tap(sw * 0.5f, sh * 0.6f)
                           }
