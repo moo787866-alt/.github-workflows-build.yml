@@ -1,0 +1,1009 @@
+name: Build AimLine APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate project files
+        run: |
+          mkdir -p app/src/main/java/com/example/aimline app/src/main/res/xml app/src/main/res/values
+          cat > settings.gradle.kts <<'AIMLINE_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "AimLine"
+          include(":app")
+          AIMLINE_EOF
+          cat > build.gradle.kts <<'AIMLINE_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          AIMLINE_EOF
+          cat > gradle.properties <<'AIMLINE_EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.nonTransitiveRClass=true
+          AIMLINE_EOF
+          cat > app/build.gradle.kts <<'AIMLINE_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.aimline"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.aimline"
+                  minSdk = 30
+                  targetSdk = 34
+                  versionCode = 2
+                  versionName = "2.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          AIMLINE_EOF
+          cat > app/src/main/AndroidManifest.xml <<'AIMLINE_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:label="Aim Line"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".OverlayService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+                  <service
+                      android:name=".TapService"
+                      android:exported="true"
+                      android:label="Aim Line auto-tap"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/tap_service" />
+                  </service>
+              </application>
+          </manifest>
+          AIMLINE_EOF
+          cat > app/src/main/res/xml/tap_service.xml <<'AIMLINE_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:description="@string/tap_service_desc"
+              android:notificationTimeout="100" />
+          AIMLINE_EOF
+          cat > app/src/main/res/values/strings.xml <<'AIMLINE_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="tap_service_desc">Lets Aim Line tap the screen for you when the aim line points at the next circle. It does not read or collect anything on your screen.</string>
+          </resources>
+          AIMLINE_EOF
+          cat > app/src/main/java/com/example/aimline/MainActivity.kt <<'AIMLINE_EOF'
+          package com.example.aimline
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.SeekBar
+          import android.widget.Switch
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+
+              private lateinit var status: TextView
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 0)
+                  }
+                  val prefs = getSharedPreferences("p", MODE_PRIVATE)
+                  val col = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(48, 120, 48, 48)
+                  }
+
+                  fun button(label: String, action: () -> Unit) {
+                      col.addView(Button(this).apply {
+                          text = label
+                          setOnClickListener { action() }
+                      })
+                  }
+
+                  button("1. Allow draw over other apps") {
+                      startActivity(
+                          Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+                      )
+                  }
+                  button("2. Start aim line") {
+                      if (!Settings.canDrawOverlays(this)) {
+                          Toast.makeText(this, "Do step 1 first", Toast.LENGTH_SHORT).show()
+                      } else {
+                          val mpm = getSystemService(MediaProjectionManager::class.java)
+                          startActivityForResult(mpm.createScreenCaptureIntent(), 1)
+                      }
+                  }
+                  button("Stop") { stopService(Intent(this, OverlayService::class.java)) }
+
+                  // ---- auto-tap
+                  col.addView(TextView(this).apply {
+                      setPadding(0, 64, 0, 0)
+                      text = "Auto-tap (optional)"
+                      textSize = 18f
+                  })
+                  button("3. Turn on the auto-tap service (Accessibility)") {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  }
+                  status = TextView(this)
+                  col.addView(status)
+                  col.addView(TextView(this).apply {
+                      text = "If Android says \"Restricted setting\": open Settings > Apps > Aim Line, " +
+                          "tap the three dots (top right), choose \"Allow restricted settings\", then try step 3 again."
+                      textSize = 12f
+                  })
+                  col.addView(Switch(this).apply {
+                      setPadding(0, 32, 0, 0)
+                      text = "Tap automatically when the line points at the next circle"
+                      isChecked = prefs.getBoolean("auto", false)
+                      setOnCheckedChangeListener { _, on -> prefs.edit().putBoolean("auto", on).apply() }
+                  })
+
+                  // ---- tuning
+                  col.addView(TextView(this).apply {
+                      setPadding(0, 64, 0, 0)
+                      text = "Tuning"
+                      textSize = 18f
+                  })
+                  slider(col, prefs, "Line lead (raise if the line lags behind the sprite)", "lead", 0, 150, 60, " ms")
+                  slider(col, prefs, "Tap lead (raise if taps land late, lower if early)", "taplead", 0, 250, 110, " ms")
+                  slider(col, prefs, "Angle trim (only if the line is always rotated the same way)", "trim", -15, 15, 0, "\u00B0")
+
+                  setContentView(ScrollView(this).apply { addView(col) })
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  status.text = if (TapService.instance != null) {
+                      "Auto-tap service: ON \u2713"
+                  } else {
+                      "Auto-tap service: OFF (turn on \"Aim Line auto-tap\" in Accessibility)"
+                  }
+              }
+
+              private fun slider(
+                  col: LinearLayout, prefs: SharedPreferences, title: String,
+                  key: String, lo: Int, hi: Int, def: Int, unit: String
+              ) {
+                  val label = TextView(this).apply { setPadding(0, 40, 0, 0) }
+                  val bar = SeekBar(this)
+                  bar.max = hi - lo
+                  fun show(v: Int) { label.text = "$title: $v$unit" }
+                  val saved = prefs.getInt(key, def)
+                  bar.progress = saved - lo
+                  show(saved)
+                  bar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
+                          prefs.edit().putInt(key, p + lo).apply()
+                          show(p + lo)
+                      }
+                      override fun onStartTrackingTouch(s: SeekBar) {}
+                      override fun onStopTrackingTouch(s: SeekBar) {}
+                  })
+                  col.addView(label)
+                  col.addView(bar)
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == 1 && resultCode == RESULT_OK && data != null) {
+                      startForegroundService(
+                          Intent(this, OverlayService::class.java)
+                              .putExtra("code", resultCode)
+                              .putExtra("data", data)
+                      )
+                      Toast.makeText(this, "Running. Open your game now.", Toast.LENGTH_LONG).show()
+                      moveTaskToBack(true)
+                  }
+              }
+          }
+          AIMLINE_EOF
+          cat > app/src/main/java/com/example/aimline/Detector.java <<'AIMLINE_EOF'
+          package com.example.aimline;
+
+          /**
+           * Pure-Java frame analysis (no Android classes, so it can be tested on a desktop JVM).
+           *
+           * Finds (1) the player sprite: the largest solid near-black blob, its centre, and which way
+           * it faces, and (2) the star cores (dense clusters of dark dots) used as targets.
+           *
+           * Facing is the principal axis of the whole filled sprite shape (uses every pixel, so it is
+           * stable), with the 180 degree ambiguity resolved by where the white iris ring sits.
+           */
+          public final class Detector {
+
+              public static final class Result {
+                  public float x, y;            // sprite centre (frame px)
+                  public float angle;           // facing direction, radians (y axis points down)
+                  public boolean confident;     // facing sign was decided by the iris ring
+                  public float tip;             // distance from centre to the nose along the facing direction
+                  public int bx0, by0, bx1, by1;
+                  public float[] stars = new float[0];   // x0,y0,x1,y1,...
+                  public int starCount;
+              }
+
+              private static final int DARK = 60;
+              private static final int LIGHT = 150;
+              private static final int STAR_DARK = 150;
+              private static final int COLOR_LIMIT = 70;   // coloured pixels (our own overlay) are ignored
+              private static final double MIN_FRAC = 0.0004;
+              private static final double MAX_FRAC = 0.02;
+              private static final int MAX_STARS = 12;
+              private static final double STAR_DENSITY = 0.16;
+
+              private final int w, h;
+              private final byte[] lum;
+              private final boolean[] seen;
+              private final int[] qa, qb;
+              private final int[] integral;
+              private final int boxR;
+              private final int step = 2;
+              private final int gw, gh;
+              private final boolean[] gridHit;
+              private final float[] gridDen;
+              private final int[] gridQ;
+
+              public Detector(int w, int h) {
+                  this.w = w;
+                  this.h = h;
+                  lum = new byte[w * h];
+                  seen = new boolean[w * h];
+                  qa = new int[w * h];
+                  qb = new int[w * h];
+                  integral = new int[(w + 1) * (h + 1)];
+                  boxR = Math.max(3, Math.round(0.016f * w));
+                  gw = w / step;
+                  gh = h / step;
+                  gridHit = new boolean[gw * gh];
+                  gridDen = new float[gw * gh];
+                  gridQ = new int[gw * gh];
+              }
+
+              private int lumAt(int i) { return lum[i] & 255; }
+
+              public Result detect(byte[] px, int stride) {
+                  for (int y = 0; y < h; y++) {
+                      int o = y * stride;
+                      int row = y * w;
+                      for (int x = 0; x < w; x++) {
+                          int r = px[o] & 255, g = px[o + 1] & 255, b = px[o + 2] & 255;
+                          int mx = Math.max(r, Math.max(g, b));
+                          int mn = Math.min(r, Math.min(g, b));
+                          lum[row + x] = (mx - mn > COLOR_LIMIT) ? (byte) 255 : (byte) (((r + g + b) * 85) >> 8);
+                          o += 4;
+                      }
+                  }
+
+                  // ---- largest 4-connected dark blob = the sprite
+                  java.util.Arrays.fill(seen, false);
+                  int bestN = 0;
+                  int[] cur = qa;
+                  int[] bestQ = qb;
+                  int total = w * h;
+                  for (int s = 0; s < total; s++) {
+                      if (lumAt(s) >= DARK || seen[s]) continue;
+                      int head = 0, tail = 0;
+                      cur[tail++] = s;
+                      seen[s] = true;
+                      while (head < tail) {
+                          int p = cur[head++];
+                          int x = p % w;
+                          int y = p / w;
+                          int q;
+                          if (x > 0) { q = p - 1; if (!seen[q] && lumAt(q) < DARK) { seen[q] = true; cur[tail++] = q; } }
+                          if (x < w - 1) { q = p + 1; if (!seen[q] && lumAt(q) < DARK) { seen[q] = true; cur[tail++] = q; } }
+                          if (y > 0) { q = p - w; if (!seen[q] && lumAt(q) < DARK) { seen[q] = true; cur[tail++] = q; } }
+                          if (y < h - 1) { q = p + w; if (!seen[q] && lumAt(q) < DARK) { seen[q] = true; cur[tail++] = q; } }
+                      }
+                      if (tail > bestN) {
+                          bestN = tail;
+                          int[] t = cur; cur = bestQ; bestQ = t;
+                      }
+                  }
+                  if (bestN < total * MIN_FRAC || bestN > total * MAX_FRAC) return null;
+
+                  int x0 = w, x1 = 0, y0 = h, y1 = 0;
+                  for (int i = 0; i < bestN; i++) {
+                      int x = bestQ[i] % w, y = bestQ[i] / w;
+                      if (x < x0) x0 = x;
+                      if (x > x1) x1 = x;
+                      if (y < y0) y0 = y;
+                      if (y > y1) y1 = y;
+                  }
+                  int bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+                  boolean[] inC = new boolean[bw * bh];
+                  for (int i = 0; i < bestN; i++) inC[(bestQ[i] / w - y0) * bw + (bestQ[i] % w - x0)] = true;
+
+                  // flood from the box border: whatever is not reached and not blob is an enclosed hole
+                  boolean[] out = new boolean[bw * bh];
+                  int[] q = new int[bw * bh];
+                  int head = 0, tail = 0;
+                  for (int x = 0; x < bw; x++) {
+                      int k = x; if (!inC[k] && !out[k]) { out[k] = true; q[tail++] = k; }
+                      k = (bh - 1) * bw + x; if (!inC[k] && !out[k]) { out[k] = true; q[tail++] = k; }
+                  }
+                  for (int y = 0; y < bh; y++) {
+                      int k = y * bw; if (!inC[k] && !out[k]) { out[k] = true; q[tail++] = k; }
+                      k = y * bw + bw - 1; if (!inC[k] && !out[k]) { out[k] = true; q[tail++] = k; }
+                  }
+                  while (head < tail) {
+                      int k = q[head++];
+                      int x = k % bw, y = k / bw, n;
+                      if (x > 0) { n = k - 1; if (!inC[n] && !out[n]) { out[n] = true; q[tail++] = n; } }
+                      if (x < bw - 1) { n = k + 1; if (!inC[n] && !out[n]) { out[n] = true; q[tail++] = n; } }
+                      if (y > 0) { n = k - bw; if (!inC[n] && !out[n]) { out[n] = true; q[tail++] = n; } }
+                      if (y < bh - 1) { n = k + bw; if (!inC[n] && !out[n]) { out[n] = true; q[tail++] = n; } }
+                  }
+
+                  // ---- moments of the filled shape
+                  double sx = 0, sy = 0;
+                  int fn = 0;
+                  for (int y = 0; y < bh; y++) for (int x = 0; x < bw; x++) {
+                      if (out[y * bw + x]) continue;
+                      sx += x; sy += y; fn++;
+                  }
+                  if (fn == 0) return null;
+                  double lcx = sx / fn, lcy = sy / fn;
+                  double sxx = 0, syy = 0, sxy = 0, rx = 0, ry = 0;
+                  int rn = 0;
+                  for (int y = 0; y < bh; y++) for (int x = 0; x < bw; x++) {
+                      int k = y * bw + x;
+                      if (out[k]) continue;
+                      double dx = x - lcx, dy = y - lcy;
+                      sxx += dx * dx; syy += dy * dy; sxy += dx * dy;
+                      if (!inC[k] && lumAt((y0 + y) * w + x0 + x) > LIGHT) { rx += x; ry += y; rn++; }
+                  }
+                  double phi = 0.5 * Math.atan2(2 * sxy, sxx - syy);
+                  double ux = Math.cos(phi), uy = Math.sin(phi);
+
+                  double m3 = 0, maxPlus = 0, maxMinus = 0;
+                  for (int y = 0; y < bh; y++) for (int x = 0; x < bw; x++) {
+                      if (out[y * bw + x]) continue;
+                      double p = (x - lcx) * ux + (y - lcy) * uy;
+                      m3 += p * p * p;
+                      if (p > maxPlus) maxPlus = p;
+                      if (-p > maxMinus) maxMinus = -p;
+                  }
+
+                  double sign;
+                  boolean confident = false;
+                  if (rn >= 10) {
+                      double e = (rx / rn - lcx) * ux + (ry / rn - lcy) * uy;
+                      if (Math.abs(e) >= 0.004 * w) { sign = e > 0 ? 1 : -1; confident = true; }
+                      else sign = m3 >= 0 ? 1 : -1;
+                  } else {
+                      sign = m3 >= 0 ? 1 : -1;
+                  }
+
+                  Result res = new Result();
+                  res.x = (float) (x0 + lcx + 0.5);
+                  res.y = (float) (y0 + lcy + 0.5);
+                  res.angle = (float) Math.atan2(sign * uy, sign * ux);
+                  res.confident = confident;
+                  res.tip = (float) (sign > 0 ? maxPlus : maxMinus);
+                  res.bx0 = x0; res.by0 = y0; res.bx1 = x1; res.by1 = y1;
+
+                  findStars(res);
+                  return res;
+              }
+
+              /** Star cores = dense clusters of dark dots. Spokes, ring dots and the aim line are too sparse to pass. */
+              private void findStars(Result res) {
+                  int pad = Math.max(4, Math.round(0.03f * w));
+                  int top = (int) (0.06 * h), bottom = (int) (0.82 * h);
+                  int W1 = w + 1;
+                  java.util.Arrays.fill(integral, 0);
+                  for (int y = 0; y < h; y++) {
+                      int rowSum = 0;
+                      boolean band = y >= top && y < bottom;
+                      boolean inSpriteRows = y >= res.by0 - pad && y <= res.by1 + pad;
+                      for (int x = 0; x < w; x++) {
+                          boolean on = band && lumAt(y * w + x) < STAR_DARK;
+                          if (on && inSpriteRows && x >= res.bx0 - pad && x <= res.bx1 + pad) on = false;
+                          if (on) rowSum++;
+                          integral[(y + 1) * W1 + x + 1] = integral[y * W1 + x + 1] + rowSum;
+                      }
+                  }
+                  int area = (2 * boxR + 1) * (2 * boxR + 1);
+                  double need = STAR_DENSITY * area;
+                  java.util.Arrays.fill(gridHit, false);
+                  for (int gy = 0; gy < gh; gy++) {
+                      int cy = gy * step;
+                      int ya = Math.max(0, cy - boxR), yb = Math.min(h - 1, cy + boxR);
+                      for (int gx = 0; gx < gw; gx++) {
+                          int cx = gx * step;
+                          int xa = Math.max(0, cx - boxR), xb = Math.min(w - 1, cx + boxR);
+                          int s = integral[(yb + 1) * W1 + xb + 1] - integral[ya * W1 + xb + 1]
+                                  - integral[(yb + 1) * W1 + xa] + integral[ya * W1 + xa];
+                          if (s >= need) { gridHit[gy * gw + gx] = true; gridDen[gy * gw + gx] = (float) s / area; }
+                      }
+                  }
+                  // label the dense regions, then merge fragments of the same core
+                  final int cap = 32;
+                  double[] ccx = new double[cap], ccy = new double[cap], cw = new double[cap];
+                  int[] cn = new int[cap];
+                  int nc = 0;
+                  for (int s = 0; s < gw * gh && nc < cap; s++) {
+                      if (!gridHit[s]) continue;
+                      int head = 0, tail = 0;
+                      gridQ[tail++] = s;
+                      gridHit[s] = false;
+                      double wx = 0, wy = 0, ws = 0;
+                      while (head < tail) {
+                          int p = gridQ[head++];
+                          int gx = p % gw, gy = p / gw;
+                          double wt = gridDen[p];
+                          wx += wt * gx; wy += wt * gy; ws += wt;
+                          for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
+                              int nx = gx + dx, ny = gy + dy;
+                              if (nx < 0 || ny < 0 || nx >= gw || ny >= gh) continue;
+                              int n = ny * gw + nx;
+                              if (gridHit[n]) { gridHit[n] = false; gridQ[tail++] = n; }
+                          }
+                      }
+                      ccx[nc] = wx / ws * step + 0.5; ccy[nc] = wy / ws * step + 0.5; cw[nc] = ws; cn[nc] = tail;
+                      nc++;
+                  }
+                  double mergeD = 0.055 * w;
+                  boolean merged = true;
+                  while (merged) {
+                      merged = false;
+                      for (int i = 0; i < nc && !merged; i++) for (int j = i + 1; j < nc && !merged; j++) {
+                          if (cn[i] == 0 || cn[j] == 0) continue;
+                          if (Math.hypot(ccx[i] - ccx[j], ccy[i] - ccy[j]) < mergeD) {
+                              double tw = cw[i] + cw[j];
+                              ccx[i] = (ccx[i] * cw[i] + ccx[j] * cw[j]) / tw;
+                              ccy[i] = (ccy[i] * cw[i] + ccy[j] * cw[j]) / tw;
+                              cw[i] = tw; cn[i] += cn[j]; cn[j] = 0;
+                              merged = true;
+                          }
+                      }
+                  }
+                  float[] pts = new float[MAX_STARS * 2];
+                  int count = 0;
+                  int minCells = Math.max(3, Math.round(0.00004f * w * w / (step * step)));
+                  int maxCells = Math.round(0.0045f * w * w / (step * step));
+                  for (int i = 0; i < nc && count < MAX_STARS; i++) {
+                      if (cn[i] < minCells || cn[i] > maxCells) continue;
+                      pts[count * 2] = (float) ccx[i];
+                      pts[count * 2 + 1] = (float) ccy[i];
+                      count++;
+                  }
+                  res.stars = pts;
+                  res.starCount = count;
+              }
+          }
+          AIMLINE_EOF
+          cat > app/src/main/java/com/example/aimline/AimEngine.java <<'AIMLINE_EOF'
+          package com.example.aimline;
+
+          /**
+           * Turns noisy per-frame detections into (1) a smooth, latency-compensated aim line and
+           * (2) an "aimed at the next circle" decision for the auto-tap. Pure Java, no Android classes.
+           *
+           * All positions are in capture-frame pixels.
+           */
+          public final class AimEngine {
+
+              /** Immutable-ish state handed to the overlay view; it extrapolates it on every screen refresh. */
+              public static final class Snapshot {
+                  public long t;                       // uptime ms of the detection this state belongs to
+                  public boolean visible, locked;
+                  public float x, y, theta, vx, vy, omega, tip;
+                  public float tx, ty, tr;             // aimed-at star (valid when locked)
+
+                  public Snapshot scaled(float fx, float fy) {
+                      Snapshot s = new Snapshot();
+                      s.t = t; s.visible = visible; s.locked = locked;
+                      s.x = x * fx; s.y = y * fy; s.theta = theta;
+                      s.vx = vx * fx; s.vy = vy * fy; s.omega = omega;
+                      s.tip = tip * fx; s.tx = tx * fx; s.ty = ty * fy; s.tr = tr * fx;
+                      return s;
+                  }
+
+                  public void at(long now, float leadMs, float[] out) {
+                      float dt = (now - t) + leadMs;
+                      if (dt < 0) dt = 0;
+                      if (dt > 250) dt = 250;
+                      dt /= 1000f;
+                      out[0] = x + vx * dt;
+                      out[1] = y + vy * dt;
+                      out[2] = theta + omega * dt;
+                  }
+              }
+
+              // ---- settings (written by the service from preferences before every update)
+              public float tapLeadMs = 110f;
+              public float trimDeg = 0f;
+              public boolean autoTap = false;
+
+              /** Set by update(): true on the one frame where a tap should be sent. */
+              public boolean fire = false;
+
+              private static final double HALF_PI = Math.PI / 2;
+              private static final long COOLDOWN_MS = 800;
+              private static final double HIT_K = 0.55;     // ray must pass within this fraction of the radius of the target centre
+
+              private final int w;
+              private final double r0;
+              private double orbitR;
+
+              private boolean has;
+              private long tLast, tSeen, tFire;
+              private double x, y, vx, vy, th, om, tip;
+              private int flip, orbitRun;
+              private boolean lastInnovationOk;
+              private double dtFrame = 0.033;
+              private boolean orbiting, locked;
+              private float tx, ty;
+
+              public AimEngine(int frameWidth) {
+                  w = frameWidth;
+                  r0 = 0.1036 * frameWidth;      // orbit radius measured from the game: ~10.4% of the screen width
+                  orbitR = r0;
+              }
+
+              private static double wrap(double a) {
+                  while (a > Math.PI) a -= 2 * Math.PI;
+                  while (a < -Math.PI) a += 2 * Math.PI;
+                  return a;
+              }
+
+              public Snapshot update(long now, Detector.Result r) {
+                  fire = false;
+                  if (r == null) {
+                      if (has && now - tSeen > 300) { has = false; orbitRun = 0; }
+                      locked = false;
+                      return snapshot();
+                  }
+                  double dt = has ? (now - tLast) / 1000.0 : 0;
+                  if (has && dt > 0.25) has = false;
+                  double z = r.angle + Math.toRadians(trimDeg);
+                  lastInnovationOk = false;
+
+                  if (!has) {
+                      x = r.x; y = r.y; vx = 0; vy = 0;
+                      th = z; om = 0; tip = r.tip;
+                      flip = 0; orbitRun = 0;
+                      has = true;
+                  } else {
+                      if (dt < 0.004) dt = 0.004;
+                      dtFrame = Math.min(0.1, Math.max(0.016, dt));
+                      double px = x + vx * dt, py = y + vy * dt, pth = th + om * dt;
+
+                      // position: alpha-beta filter
+                      double ex = r.x - px, ey = r.y - py;
+                      double e = Math.hypot(ex, ey);
+                      if (e > 0.15 * w) {
+                          x = r.x; y = r.y; vx = 0; vy = 0;
+                      } else {
+                          boolean big = e > 0.02 * w;
+                          double a = big ? 0.85 : 0.6, b = big ? 0.4 : 0.15;
+                          x = px + a * ex;
+                          y = py + a * ey;
+                          vx += b * ex / dt;
+                          vy += b * ey / dt;
+                      }
+
+                      // angle: alpha-beta filter on the unwrapped angle
+                      double d = wrap(z - pth);
+                      boolean accept = true;
+                      if (Math.abs(d) > 1.75) {
+                          if (!r.confident) {
+                              d = wrap(z + Math.PI - pth);          // sign ambiguity: assume the nose/tail got swapped
+                          } else {
+                              flip++;
+                              accept = false;
+                              if (flip >= 3) { th = z; om = 0; flip = 0; }
+                          }
+                      } else {
+                          flip = 0;
+                      }
+                      if (accept) {
+                          boolean big = Math.abs(d) > 0.12;
+                          double a = big ? 0.8 : 0.35, b = big ? 0.3 : 0.07;
+                          th = pth + a * d;
+                          om += b * d / dt;
+                          if (om > 12) om = 12;
+                          if (om < -12) om = -12;
+                          lastInnovationOk = Math.abs(d) < 0.07;
+                      } else {
+                          th = pth;
+                      }
+                      th = wrap(th);
+                      tip += 0.2 * (r.tip - tip);
+                  }
+                  tLast = now;
+                  tSeen = now;
+
+                  findOrbitAndTarget(now, r);
+                  return snapshot();
+              }
+
+              private void findOrbitAndTarget(long now, Detector.Result r) {
+                  orbiting = false;
+                  locked = false;
+                  int cur = -1;
+                  double bestScore = 1e9, curDist = 0;
+                  for (int i = 0; i < r.starCount; i++) {
+                      double sx = r.stars[2 * i], sy = r.stars[2 * i + 1];
+                      double dist = Math.hypot(x - sx, y - sy);
+                      if (dist < 0.65 * orbitR || dist > 1.45 * orbitR) continue;
+                      double ang = Math.atan2(y - sy, x - sx);
+                      double err = Math.min(Math.abs(wrap(th - (ang + HALF_PI))), Math.abs(wrap(th - (ang - HALF_PI))));
+                      if (err > 0.65) continue;     // the sprite faces along the orbit tangent when it is orbiting
+                      double score = err + Math.abs(dist - orbitR) / orbitR;
+                      if (score < bestScore) { bestScore = score; cur = i; curDist = dist; }
+                  }
+                  if (cur < 0) { orbitRun = 0; return; }
+                  orbiting = true;
+                  orbitRun++;
+                  orbitR += 0.03 * (curDist - orbitR);
+                  if (orbitR < 0.8 * r0) orbitR = 0.8 * r0;
+                  if (orbitR > 1.2 * r0) orbitR = 1.2 * r0;
+
+                  // where will the sprite be, and which way will it face, when the tap actually lands?
+                  double L = tapLeadMs / 1000.0;
+                  double fx = x + vx * L, fy = y + vy * L, fth = th + om * L;
+                  double ux = Math.cos(fth), uy = Math.sin(fth);
+                  double curY = r.stars[2 * cur + 1];
+                  int hit = -1;
+                  double hitT = 1e18, hitD = 0, hitEps = 0;
+                  for (int j = 0; j < r.starCount; j++) {
+                      if (j == cur) continue;
+                      double rx = r.stars[2 * j] - fx, ry = r.stars[2 * j + 1] - fy;
+                      double t = rx * ux + ry * uy;
+                      if (t < 0.5 * orbitR) continue;
+                      double d = Math.abs(rx * uy - ry * ux);
+                      if (d < 0.95 * orbitR && t < hitT) { hit = j; hitT = t; hitD = d; hitEps = wrap(Math.atan2(ry, rx) - fth); }
+                  }
+                  if (hit >= 0 && hitD < HIT_K * orbitR && r.stars[2 * hit + 1] < curY - 0.3 * orbitR) {
+                      locked = true;
+                      tx = r.stars[2 * hit];
+                      ty = r.stars[2 * hit + 1];
+                  }
+                  // tap when the line is closest to the middle of the target: within half a frame step of crossing it
+                  boolean centred = locked && Math.abs(hitEps) <= Math.max(0.5 * Math.abs(om) * dtFrame, 0.03);
+                  if (centred && autoTap && orbitRun >= 4 && lastInnovationOk && now - tFire > COOLDOWN_MS) {
+                      fire = true;
+                      tFire = now;
+                  }
+              }
+
+              private Snapshot snapshot() {
+                  Snapshot s = new Snapshot();
+                  s.t = tLast;
+                  s.visible = has;
+                  s.locked = locked;
+                  s.x = (float) x; s.y = (float) y; s.theta = (float) th;
+                  s.vx = (float) vx; s.vy = (float) vy; s.omega = (float) om;
+                  s.tip = (float) tip;
+                  s.tx = tx; s.ty = ty; s.tr = (float) orbitR;
+                  return s;
+              }
+          }
+          AIMLINE_EOF
+          cat > app/src/main/java/com/example/aimline/LineView.kt <<'AIMLINE_EOF'
+          package com.example.aimline
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.DashPathEffect
+          import android.graphics.Paint
+          import android.os.SystemClock
+          import android.view.View
+          import kotlin.math.cos
+          import kotlin.math.hypot
+          import kotlin.math.sin
+
+          /**
+           * Transparent, touch-through view. It re-draws on every screen refresh and extrapolates the
+           * last detection forward in time, so the line moves smoothly and stays ahead of capture lag.
+           */
+          class LineView(context: Context) : View(context) {
+              @Volatile var snap: AimEngine.Snapshot? = null
+              @Volatile var leadMs = 60f
+
+              private val pos = FloatArray(3)
+              private val loc = IntArray(2)
+
+              // Orange / green are strongly coloured, so the detector (which only looks at grey pixels)
+              // never mistakes the overlay for the game's sprite or stars.
+              private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.rgb(255, 120, 0)
+                  strokeWidth = 7f
+                  strokeCap = Paint.Cap.ROUND
+                  pathEffect = DashPathEffect(floatArrayOf(1f, 20f), 0f)
+              }
+              private val lockPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.rgb(0, 210, 90)
+                  strokeWidth = 9f
+                  strokeCap = Paint.Cap.ROUND
+                  pathEffect = DashPathEffect(floatArrayOf(1f, 20f), 0f)
+              }
+              private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.rgb(0, 210, 90)
+                  style = Paint.Style.STROKE
+                  strokeWidth = 5f
+              }
+
+              override fun onDraw(canvas: Canvas) {
+                  val s = snap ?: return
+                  val now = SystemClock.uptimeMillis()
+                  if (!s.visible || now - s.t > 400) return
+                  s.at(now, leadMs, pos)
+
+                  // draw in true screen coordinates even if the system offsets this window (insets, cutouts)
+                  getLocationOnScreen(loc)
+                  canvas.save()
+                  canvas.translate(-loc[0].toFloat(), -loc[1].toFloat())
+
+                  val ux = cos(pos[2])
+                  val uy = sin(pos[2])
+                  val x0 = pos[0] + ux * s.tip      // start at the nose, where the game's own line starts
+                  val y0 = pos[1] + uy * s.tip
+                  val len = hypot(width.toFloat(), height.toFloat())
+                  canvas.drawLine(x0, y0, x0 + ux * len, y0 + uy * len, if (s.locked) lockPaint else paint)
+                  if (s.locked) canvas.drawCircle(s.tx, s.ty, s.tr, ringPaint)
+                  canvas.restore()
+                  postInvalidateOnAnimation()
+              }
+          }
+          AIMLINE_EOF
+          cat > app/src/main/java/com/example/aimline/TapService.kt <<'AIMLINE_EOF'
+          package com.example.aimline
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Intent
+          import android.graphics.Path
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.accessibility.AccessibilityEvent
+
+          /** Lets the app tap the screen for you. It only ever sends the single tap that AimLine asks for. */
+          class TapService : AccessibilityService() {
+
+              private val main = Handler(Looper.getMainLooper())
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  instance = this
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+
+              override fun onInterrupt() {}
+
+              override fun onUnbind(intent: Intent?): Boolean {
+                  if (instance === this) instance = null
+                  return super.onUnbind(intent)
+              }
+
+              fun tap(x: Float, y: Float) {
+                  main.post {
+                      val path = Path().apply { moveTo(x, y) }
+                      val stroke = GestureDescription.StrokeDescription(path, 0L, 35L)
+                      val gesture = GestureDescription.Builder().addStroke(stroke).build()
+                      dispatchGesture(gesture, null, null)
+                  }
+              }
+
+              companion object {
+                  @Volatile
+                  var instance: TapService? = null
+              }
+          }
+          AIMLINE_EOF
+          cat > app/src/main/java/com/example/aimline/OverlayService.kt <<'AIMLINE_EOF'
+          package com.example.aimline
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.drawable.Icon
+          import android.graphics.PixelFormat
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.Handler
+          import android.os.HandlerThread
+          import android.os.IBinder
+          import android.os.SystemClock
+          import android.view.Gravity
+          import android.view.WindowManager
+
+          class OverlayService : Service() {
+
+              private var projection: MediaProjection? = null
+              private var vDisplay: VirtualDisplay? = null
+              private var reader: ImageReader? = null
+              private var overlay: LineView? = null
+              private var wm: WindowManager? = null
+              private val thread = HandlerThread("aimline-detect").apply { start() }
+              private lateinit var handler: Handler
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              @Suppress("DEPRECATION")
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent == null || intent.action == ACTION_STOP) { stopSelf(); return START_NOT_STICKY }
+                  if (projection != null) return START_NOT_STICKY
+                  handler = Handler(thread.looper)
+
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("aim", "Aim line", NotificationManager.IMPORTANCE_LOW))
+                  val stopPi = PendingIntent.getService(
+                      this, 0, Intent(this, OverlayService::class.java).setAction(ACTION_STOP), PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val stopAction = Notification.Action.Builder(
+                      Icon.createWithResource(this, android.R.drawable.ic_delete), "Stop", stopPi
+                  ).build()
+                  val notif = Notification.Builder(this, "aim")
+                      .setSmallIcon(android.R.drawable.ic_menu_compass)
+                      .setContentTitle("Aim line is running")
+                      .addAction(stopAction)
+                      .build()
+                  startForeground(1, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+
+                  val code = intent.getIntExtra("code", 0)
+                  val data = intent.getParcelableExtra<Intent>("data") ?: run { stopSelf(); return START_NOT_STICKY }
+                  val mpm = getSystemService(MediaProjectionManager::class.java)
+                  val proj = mpm.getMediaProjection(code, data)
+                  projection = proj
+                  proj.registerCallback(object : MediaProjection.Callback() {
+                      override fun onStop() { stopSelf() }
+                  }, handler)
+
+                  val windowManager = getSystemService(WindowManager::class.java)
+                  wm = windowManager
+                  val bounds = windowManager.maximumWindowMetrics.bounds
+                  val sw = bounds.width()
+                  val sh = bounds.height()
+                  // analyse a frame that is roughly 540 px wide, whatever the screen size
+                  val scale = Math.round(sw / 540f).coerceAtLeast(1)
+                  val cw = sw / scale
+                  val ch = sh / scale
+                  val fx = sw.toFloat() / cw
+                  val fy = sh.toFloat() / ch
+
+                  val view = LineView(this)
+                  overlay = view
+                  val lp = WindowManager.LayoutParams(
+                      sw, sh,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  lp.gravity = Gravity.TOP or Gravity.START
+                  lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                  windowManager.addView(view, lp)
+
+                  val detector = Detector(cw, ch)
+                  val engine = AimEngine(cw)
+                  val prefs = getSharedPreferences("p", MODE_PRIVATE)
+                  val img = ImageReader.newInstance(cw, ch, PixelFormat.RGBA_8888, 2)
+                  reader = img
+                  var bytes = ByteArray(0)
+                  var lastRun = 0L
+
+                  img.setOnImageAvailableListener({ r ->
+                      val image = r.acquireLatestImage() ?: return@setOnImageAvailableListener
+                      try {
+                          val now = SystemClock.uptimeMillis()
+                          if (now - lastRun < 20) return@setOnImageAvailableListener
+                          lastRun = now
+                          val plane = image.planes[0]
+                          val buf = plane.buffer
+                          if (bytes.size != buf.remaining()) bytes = ByteArray(buf.remaining())
+                          buf.get(bytes)
+
+                          engine.autoTap = prefs.getBoolean("auto", false)
+                          engine.tapLeadMs = prefs.getInt("taplead", 110).toFloat()
+                          engine.trimDeg = prefs.getInt("trim", 0).toFloat()
+                          view.leadMs = prefs.getInt("lead", 60).toFloat()
+
+                          val res = detector.detect(bytes, plane.rowStride)
+                          view.snap = engine.update(now, res).scaled(fx, fy)
+                          if (engine.fire) {
+                              TapService.instance?.tap(sw * 0.5f, sh * 0.6f)
+                          }
+                          view.postInvalidate()
+                      } finally {
+                          image.close()
+                      }
+                  }, handler)
+
+                  vDisplay = proj.createVirtualDisplay(
+                      "aimline", cw, ch, resources.displayMetrics.densityDpi,
+                      DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, img.surface, null, handler
+                  )
+                  return START_NOT_STICKY
+              }
+
+              override fun onDestroy() {
+                  vDisplay?.release()
+                  reader?.close()
+                  projection?.stop()
+                  overlay?.let { runCatching { wm?.removeView(it) } }
+                  thread.quitSafely()
+                  super.onDestroy()
+              }
+
+              companion object {
+                  const val ACTION_STOP = "com.example.aimline.STOP"
+              }
+          }
+          AIMLINE_EOF
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AimLine-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+      - name: Publish release with APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: AimLine build ${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
