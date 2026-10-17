@@ -39,8 +39,8 @@ jobs:
                   applicationId = "com.example.aimline"
                   minSdk = 30
                   targetSdk = 34
-                  versionCode = 3
-                  versionName = "2.1"
+                  versionCode = 4
+                  versionName = "3.0"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -105,9 +105,12 @@ jobs:
 
           import android.Manifest
           import android.app.Activity
+          import android.content.ClipData
+          import android.content.ClipboardManager
           import android.content.Intent
           import android.content.SharedPreferences
           import android.media.projection.MediaProjectionManager
+          import android.graphics.Typeface
           import android.net.Uri
           import android.os.Build
           import android.os.Bundle
@@ -123,6 +126,7 @@ jobs:
           class MainActivity : Activity() {
 
               private lateinit var status: TextView
+              private lateinit var logView: TextView
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
@@ -136,7 +140,7 @@ jobs:
                   }
 
                   col.addView(TextView(this).apply {
-                      text = "Aim Line v2.1"
+                      text = "Aim Line v3.0"
                       textSize = 20f
                   })
 
@@ -195,11 +199,45 @@ jobs:
                   slider(col, prefs, "Tap lead (raise if taps land late, lower if early)", "taplead", 0, 250, 110, " ms")
                   slider(col, prefs, "Angle trim (only if the line is always rotated the same way)", "trim", -15, 15, 0, "\u00B0")
 
+                  // ---- circle log
+                  col.addView(TextView(this).apply {
+                      setPadding(0, 64, 0, 0)
+                      text = "Circle log (radius vs speed)"
+                      textSize = 18f
+                  })
+                  col.addView(TextView(this).apply {
+                      text = "Every circle you play is measured automatically. After 10-15 circles of different sizes, tap Copy log and send it to me."
+                      textSize = 12f
+                  })
+                  logView = TextView(this).apply {
+                      typeface = Typeface.MONOSPACE
+                      textSize = 11f
+                      setTextIsSelectable(true)
+                      setPadding(0, 24, 0, 24)
+                  }
+                  col.addView(logView)
+                  button("Refresh log") { refreshLog() }
+                  button("Copy log") {
+                      val cm = getSystemService(ClipboardManager::class.java)
+                      cm.setPrimaryClip(ClipData.newPlainText("AimLine circle log", OrbitLog.export(this)))
+                      Toast.makeText(this, "Copied", Toast.LENGTH_SHORT).show()
+                  }
+                  button("Share log") {
+                      val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, OrbitLog.export(this))
+                      startActivity(Intent.createChooser(send, "Share circle log"))
+                  }
+                  button("Clear log") { OrbitLog.clear(this); refreshLog() }
+
                   setContentView(ScrollView(this).apply { addView(col) })
+              }
+
+              private fun refreshLog() {
+                  logView.text = OrbitLog.summary(this) + "\n\n" + OrbitLog.recent(this, 12)
               }
 
               override fun onResume() {
                   super.onResume()
+                  refreshLog()
                   status.text = if (TapService.instance != null) {
                       "Auto-tap service: ON \u2713"
                   } else {
@@ -524,39 +562,53 @@ jobs:
           cat > app/src/main/java/com/example/aimline/AimEngine.java <<'AIMLINE_EOF'
           package com.example.aimline;
 
+          import java.util.ArrayDeque;
+
           /**
-           * Turns noisy per-frame detections into (1) a smooth, latency-compensated aim line and
-           * (2) an "aimed at the next circle" decision for the auto-tap. Pure Java, no Android classes.
+           * Turns noisy per-frame detections into (1) a steady aim line and (2) an exact tap time.
+           * Pure Java, no Android classes.
            *
-           * While the sprite circles a star, a circle is fitted to the last second of motion
-           * (constant angular speed, facing along the tangent). The line is then drawn from that fitted
-           * path instead of from single noisy frames, so it does not shake. Outside an orbit a plain
-           * alpha-beta filter is used.
+           * Why the old line wobbled: its direction came from the sprite's drawn shape, which changes a
+           * little on every frame. Here the direction never comes from the shape while orbiting. The sprite
+           * is moving on a circle, so its facing IS the tangent of that circle:
            *
-           * All positions are in capture-frame pixels; all times are in milliseconds.
+           *     heading = phase + (+-90 degrees)          (sign = direction of travel)
+           *
+           * A circle (centre, radius) and a constant angular speed are fitted to the last second of sprite
+           * positions, so every circle gets its own radius and its own speed. Only positions are used
+           * (centroid of the whole sprite - very stable), never the facing angle.
+           *
+           * Between circles (flying) the heading is the direction the sprite is actually travelling.
+           *
+           * Tap time is solved, not guessed: from the fitted circle the engine computes the exact phase at
+           * which leaving along the tangent passes through the middle of the next circle, converts it into a
+           * time with the fitted speed, and the service sends the tap at exactly that time (minus the tap lead).
+           *
+           * Positions are capture-frame pixels, times are milliseconds on the uptime clock.
            */
           public final class AimEngine {
 
               /** State handed to the overlay view, which evaluates it on every screen refresh. */
               public static final class Snapshot {
-                  public double t;                     // capture time (uptime clock) this state belongs to
-                  public boolean visible, locked, orbit;
-                  public float x, y, theta, vx, vy, omega, tip;      // alpha-beta state (used when not orbiting)
-                  public float tx, ty, tr;                           // aimed-at star (valid when locked)
-                  public float ocx, ocy, oR, oPhi, oOmega, oDelta, oSign;   // fitted orbit (valid when orbit)
+                  public double t;                         // capture time this state belongs to
+                  public boolean visible, orbit, hasTarget, locked;
+                  public float x, y, theta, vx, vy, tip;   // flight state (used when not orbit)
+                  public float tx, ty, tr;                 // target circle
+                  public float ocx, ocy, oR, oPhi, oOmega, oTrim;   // fitted orbit (used when orbit)
+                  public double hideFrom = 1e18;           // orbit line is hidden after the expected release
 
                   public Snapshot scaled(float fx, float fy) {
                       Snapshot s = new Snapshot();
-                      s.t = t; s.visible = visible; s.locked = locked; s.orbit = orbit;
-                      s.x = x * fx; s.y = y * fy; s.theta = theta;
-                      s.vx = vx * fx; s.vy = vy * fy; s.omega = omega;
-                      s.tip = tip * fx; s.tx = tx * fx; s.ty = ty * fy; s.tr = tr * fx;
+                      s.t = t; s.visible = visible; s.orbit = orbit; s.hasTarget = hasTarget; s.locked = locked;
+                      s.x = x * fx; s.y = y * fy; s.theta = theta; s.vx = vx * fx; s.vy = vy * fy; s.tip = tip * fx;
+                      s.tx = tx * fx; s.ty = ty * fy; s.tr = tr * fx;
                       s.ocx = ocx * fx; s.ocy = ocy * fy; s.oR = oR * fx;
-                      s.oPhi = oPhi; s.oOmega = oOmega; s.oDelta = oDelta; s.oSign = oSign;
+                      s.oPhi = oPhi; s.oOmega = oOmega; s.oTrim = oTrim;
+                      s.hideFrom = hideFrom;
                       return s;
                   }
 
-                  /** Position and facing angle at time now (+ lead). out = {x, y, theta}. */
+                  /** Position and heading at time now (+ lead). out = {x, y, theta}. */
                   public void at(long now, float leadMs, float[] out) {
                       float dt = (float) ((now - t) + leadMs);
                       if (dt < 0) dt = 0;
@@ -566,11 +618,11 @@ jobs:
                           float phi = oPhi + oOmega * dt;
                           out[0] = ocx + oR * (float) Math.cos(phi);
                           out[1] = ocy + oR * (float) Math.sin(phi);
-                          out[2] = phi + oSign * (float) (Math.PI / 2) + oDelta;
+                          out[2] = phi + (oOmega > 0 ? 1f : -1f) * (float) (Math.PI / 2) + oTrim;
                       } else {
                           out[0] = x + vx * dt;
                           out[1] = y + vy * dt;
-                          out[2] = theta + omega * dt;
+                          out[2] = theta;
                       }
                   }
               }
@@ -579,55 +631,54 @@ jobs:
               public float tapLeadMs = 110f;
               public float trimDeg = 0f;
               public boolean autoTap = false;
-              public boolean orbitFit = true;      // false = plain filter only (kept for testing)
 
-              /** Set by update(): true on the one frame where a tap should be sent. */
-              public boolean fire = false;
+              /** Set by update(): uptime (ms) at which a tap must be sent, or -1 for none. */
+              public double fireAtMs = -1;
 
               private static final double HALF_PI = Math.PI / 2;
-              private static final double COOLDOWN_MS = 800;
-              private static final double HIT_K = 0.55;
               private static final double WINDOW_MS = 1000;
+              private static final double VMIN = 0.12;        // flight speed (frame widths / s) above which velocity gives the heading
               private static final int CAP = 64;
 
               private final int w;
-              private final double r0;
-              private double orbitR;
+              private final double r0;                         // typical orbit radius, only used as a size reference
 
-              // alpha-beta state
-              private boolean has;
-              private double tLast, tSeen, tFire = -1e9;
-              private double x, y, vx, vy, th, om, tip;
+              // ---- sprite filter (position + velocity)
+              private boolean has, moving;
+              private double tLast, tSeen;
+              private double x, y, vx, vy, thShape, thFly, tip;
               private int flip;
-              private boolean lastInnovationOk;
               private double dtFrame = 0.033;
 
-              // capture-time clock
+              // ---- capture-time clock
               private long lastTsNs;
               private double tsOffset;
               private boolean haveOffset;
+              private int clockFrames;                       // the clock offset needs a moment to settle on the lowest delay
 
-              // orbit session
-              private boolean orbitActive;
-              private int orbitRun, orbitMiss;
-              private double ocx, ocy;
-              private double phiPrev, phiUnw;
-              private final double[] bt = new double[CAP], bphi = new double[CAP], bth = new double[CAP];
-              private final double[] bx = new double[CAP], by = new double[CAP], tphi = new double[CAP];
-              private final double[] cf = new double[3];
-              private double fitCx, fitCy;
+              // ---- orbit session
+              private boolean orbitActive, haveFit, centreFromPath;
+              private double pathSince = -1;
+              private int runCount, missCount;
+              private double runX, runY, runDist, orbitStartT;
+              private double ocx, ocy;                         // detected centre of the star being circled
+              private double oCx, oCy, oR, oOm, oPhi, oT;      // fitted orbit state (phase oPhi at time oT)
+              private final double[] bt = new double[CAP], bx = new double[CAP], by = new double[CAP], tphi = new double[CAP];
               private final boolean[] keep = new boolean[CAP];
+              private final double[] cf = new double[3];
               private int n;
-              private boolean fitValid;
-              private double fitPhi, fitOm, fitR, fitDelta, fitS;
 
-              private boolean locked;
-              private float tx, ty;
+              // ---- target / tap
+              private boolean targetKnown, locked;
+              private double tx, ty;
+              private double tFire = -1e9, tReleaseExp = -1;
+
+              // ---- per-circle records for the log
+              private final ArrayDeque<double[]> records = new ArrayDeque<>();
 
               public AimEngine(int frameWidth) {
                   w = frameWidth;
-                  r0 = 0.1036 * frameWidth;      // orbit radius measured from the game: ~10.4% of the screen width
-                  orbitR = r0;
+                  r0 = 0.1036 * frameWidth;
               }
 
               private static double wrap(double a) {
@@ -636,191 +687,213 @@ jobs:
                   return a;
               }
 
-              /**
-               * Frame capture time on the uptime clock. Uses the image's own timestamp (steady) and only
-               * borrows the arrival clock for the offset, so uneven delivery does not look like motion.
-               */
-              private double captureTime(long arrivalMs, long tsNs) {
-                  if (tsNs <= 0 || tsNs <= lastTsNs) return arrivalMs;
-                  double tsMs = tsNs / 1e6;
-                  double sample = arrivalMs - tsMs;
-                  if (!haveOffset) { tsOffset = sample; haveOffset = true; }
-                  else if (sample < tsOffset) tsOffset = sample;
-                  else tsOffset += 0.01 * (sample - tsOffset);
-                  lastTsNs = tsNs;
-                  return tsMs + tsOffset;
-              }
-
-              public Snapshot update(long arrivalMs, long tsNs, Detector.Result r) {
-                  fire = false;
-                  double tc = captureTime(arrivalMs, tsNs);
-                  if (r == null) {
-                      if (has && tc - tSeen > 300) { has = false; endOrbit(); }
-                      locked = false;
-                      return snapshot();
-                  }
-                  double dt = has ? (tc - tLast) / 1000.0 : 0;
-                  if (has && (dt > 0.25 || dt < 0)) { has = false; endOrbit(); }
-                  double z = r.angle + Math.toRadians(trimDeg);
-                  double measTheta = Double.NaN;
-                  lastInnovationOk = false;
-
-                  if (!has) {
-                      x = r.x; y = r.y; vx = 0; vy = 0;
-                      th = z; om = 0; tip = r.tip;
-                      flip = 0;
-                      has = true;
-                      measTheta = z;
-                  } else {
-                      if (dt < 0.004) dt = 0.004;
-                      dtFrame = Math.min(0.1, Math.max(0.016, dt));
-                      double px = x + vx * dt, py = y + vy * dt, pth = th + om * dt;
-
-                      double ex = r.x - px, ey = r.y - py;
-                      double e = Math.hypot(ex, ey);
-                      if (e > 0.15 * w) {
-                          x = r.x; y = r.y; vx = 0; vy = 0;
-                      } else {
-                          boolean big = e > 0.02 * w;
-                          double a = big ? 0.85 : 0.6, b = big ? 0.4 : 0.15;
-                          x = px + a * ex;
-                          y = py + a * ey;
-                          vx += b * ex / dt;
-                          vy += b * ey / dt;
-                      }
-
-                      double d = wrap(z - pth);
-                      boolean accept = true;
-                      if (Math.abs(d) > 1.75) {
-                          if (!r.confident) {
-                              d = wrap(z + Math.PI - pth);          // sign ambiguity: assume the nose/tail got swapped
-                          } else {
-                              flip++;
-                              accept = false;
-                              if (flip >= 3) { th = z; om = 0; flip = 0; }
-                          }
-                      } else {
-                          flip = 0;
-                      }
-                      if (accept) {
-                          measTheta = pth + d;
-                          boolean big = Math.abs(d) > 0.12;
-                          double a = big ? 0.8 : 0.35, b = big ? 0.3 : 0.07;
-                          th = pth + a * d;
-                          om += b * d / dt;
-                          if (om > 12) om = 12;
-                          if (om < -12) om = -12;
-                          lastInnovationOk = Math.abs(d) < 0.07;
-                      } else {
-                          th = pth;
-                      }
-                      th = wrap(th);
-                      tip += 0.05 * (r.tip - tip);       // slow: a jittery start point would make the dots shimmer
-                  }
-                  tLast = tc;
-                  tSeen = tc;
-
-                  updateOrbit(tc, r, measTheta);
-                  findTarget(tc, r);
-                  return snapshot();
-              }
-
               private static double tangentErr(double facing, double radial) {
                   return Math.min(Math.abs(wrap(facing - (radial + HALF_PI))), Math.abs(wrap(facing - (radial - HALF_PI))));
               }
 
-              private void endOrbit() {
-                  orbitActive = false;
-                  fitValid = false;
-                  orbitRun = 0;
-                  orbitMiss = 0;
-                  n = 0;
+              /** Capture time on the uptime clock: the image's own timestamp, offset by the lowest delivery delay seen. */
+              private double captureTime(long arrivalMs, long tsNs) {
+                  if (tsNs <= 0 || tsNs <= lastTsNs) return arrivalMs;
+                  double tsMs = tsNs / 1e6;
+                  clockFrames++;
+                  double sample = arrivalMs - tsMs;
+                  if (!haveOffset) { tsOffset = sample; haveOffset = true; }
+                  else if (sample < tsOffset) tsOffset = sample;
+                  else tsOffset += 0.002 * (sample - tsOffset);      // delivery delays are only ever late, so follow the minimum
+                  lastTsNs = tsNs;
+                  return tsMs + tsOffset;
               }
 
-              private void updateOrbit(double tc, Detector.Result r, double measTheta) {
-                  if (orbitActive) {
-                      // keep the centre fresh using the detection of the same star
-                      int bi = -1;
-                      double bdist = 0.35 * orbitR;
-                      for (int i = 0; i < r.starCount; i++) {
-                          double d = Math.hypot(r.stars[2 * i] - ocx, r.stars[2 * i + 1] - ocy);
-                          if (d < bdist) { bdist = d; bi = i; }
-                      }
-                      if (bi >= 0) {
-                          ocx += 0.1 * (r.stars[2 * bi] - ocx);
-                          ocy += 0.1 * (r.stars[2 * bi + 1] - ocy);
-                      }
-                      double dist = Math.hypot(r.x - ocx, r.y - ocy);
-                      double err = tangentErr(th, Math.atan2(r.y - ocy, r.x - ocx));
-                      if (dist < 0.6 * orbitR || dist > 1.6 * orbitR || err > 0.8) {
-                          if (++orbitMiss >= 3) endOrbit();
-                      } else {
-                          orbitMiss = 0;
-                      }
-                  } else {
-                      int cur = -1;
-                      double bestScore = 1e9;
-                      for (int i = 0; i < r.starCount; i++) {
-                          double sx = r.stars[2 * i], sy = r.stars[2 * i + 1];
-                          double dist = Math.hypot(x - sx, y - sy);
-                          if (dist < 0.65 * orbitR || dist > 1.45 * orbitR) continue;
-                          double err = tangentErr(th, Math.atan2(y - sy, x - sx));
-                          if (err > 0.65) continue;     // the sprite faces along the orbit tangent when it is orbiting
-                          double score = err + Math.abs(dist - orbitR) / orbitR;
-                          if (score < bestScore) { bestScore = score; cur = i; }
-                      }
-                      if (cur < 0) { orbitRun = 0; return; }
-                      if (++orbitRun >= 4) {
-                          orbitActive = true;
-                          orbitMiss = 0;
-                          ocx = r.stars[2 * cur];
-                          ocy = r.stars[2 * cur + 1];
-                          n = 0;
-                          fitValid = false;
-                      }
+              /** One finished circle: {radius / frame width, signed rad/s, speed in frame widths/s, seconds}. Null if none waiting. */
+              public double[] pollRecord() {
+                  return records.poll();
+              }
+
+              public Snapshot update(long arrivalMs, long tsNs, Detector.Result r) {
+                  fireAtMs = -1;
+                  double tc = captureTime(arrivalMs, tsNs);
+                  if (r == null) {
+                      if (has && tc - tSeen > 300) { has = false; endOrbit(tc); }
+                      return snapshot();
                   }
-                  if (!orbitActive) return;
-                  addSample(tc, r, measTheta);
+                  double dt = has ? (tc - tLast) / 1000.0 : 0;
+                  if (has && (dt > 0.25 || dt < 0)) { has = false; endOrbit(tc); dt = 0; }
+                  track(dt, r);
+                  tLast = tc;
+                  tSeen = tc;
+                  if (orbitActive) followOrbit(tc, r); else seekOrbit(tc, r);
+                  chooseTarget(tc, arrivalMs, r);
+                  return snapshot();
+              }
+
+              // ------------------------------------------------------------------ sprite filter
+
+              private void track(double dt, Detector.Result r) {
+                  double z = r.angle;
+                  if (!has) {
+                      x = r.x; y = r.y; vx = 0; vy = 0;
+                      thShape = z; thFly = z; tip = r.tip;
+                      flip = 0; moving = false; has = true;
+                      return;
+                  }
+                  if (dt < 0.004) dt = 0.004;
+                  dtFrame = Math.min(0.1, Math.max(0.016, dt));
+                  double px = x + vx * dt, py = y + vy * dt;
+                  double ex = r.x - px, ey = r.y - py;
+                  double e = Math.hypot(ex, ey);
+                  if (e > 0.15 * w) {
+                      x = r.x; y = r.y; vx = 0; vy = 0;
+                  } else {
+                      boolean big = e > 0.02 * w;
+                      double a = big ? 0.85 : 0.6, b = big ? 0.4 : 0.15;
+                      x = px + a * ex;
+                      y = py + a * ey;
+                      vx += b * ex / dt;
+                      vy += b * ey / dt;
+                  }
+                  // shape angle: only a fallback while the sprite is (almost) standing still
+                  double d = wrap(z - thShape);
+                  if (Math.abs(d) > 1.75) {
+                      if (!r.confident) d = wrap(z + Math.PI - thShape);
+                      else if (++flip >= 3) { thShape = z; d = 0; flip = 0; }
+                      else d = 0;
+                  } else {
+                      flip = 0;
+                  }
+                  thShape = wrap(thShape + 0.3 * d);
+                  // flight heading = direction of travel
+                  if (Math.hypot(vx, vy) > VMIN * w) {
+                      double dir = Math.atan2(vy, vx);
+                      if (!moving) { thFly = dir; moving = true; }
+                      else thFly = wrap(thFly + 0.3 * wrap(dir - thFly));
+                  } else {
+                      moving = false;
+                      thFly = thShape;
+                  }
+                  tip += 0.05 * (r.tip - tip);
+              }
+
+              // ------------------------------------------------------------------ orbit
+
+              private void seekOrbit(double tc, Detector.Result r) {
+                  int cur = -1;
+                  double best = 1e9, bestDist = 0;
+                  for (int i = 0; i < r.starCount; i++) {
+                      double sx = r.stars[2 * i], sy = r.stars[2 * i + 1];
+                      double dist = Math.hypot(x - sx, y - sy);
+                      if (dist < 0.45 * r0 || dist > 2.4 * r0) continue;
+                      double err = tangentErr(thFly, Math.atan2(y - sy, x - sx));
+                      if (err > 0.6) continue;
+                      if (err < best) { best = err; cur = i; bestDist = dist; }
+                  }
+                  if (cur < 0) { runCount = 0; return; }
+                  double sx = r.stars[2 * cur], sy = r.stars[2 * cur + 1];
+                  if (runCount > 0 && Math.hypot(sx - runX, sy - runY) < 0.25 * r0 && Math.abs(bestDist - runDist) < 0.15 * runDist) {
+                      runCount++;
+                  } else {
+                      runCount = 1; runX = sx; runY = sy; runDist = bestDist;
+                  }
+                  if (runCount >= 5) {
+                      orbitActive = true;
+                      haveFit = false;
+                      missCount = 0;
+                      n = 0;
+                      ocx = sx; ocy = sy;
+                      oR = bestDist;
+                      orbitStartT = tc;
+                  }
+              }
+
+              private void followOrbit(double tc, Detector.Result r) {
+                  // is the sprite still on the circle?
+                  boolean bad;
+                  if (haveFit) {
+                      double phi = oPhi + oOm * (tc - oT) / 1000.0;
+                      double err = Math.hypot(r.x - (oCx + oR * Math.cos(phi)), r.y - (oCy + oR * Math.sin(phi)));
+                      double dist = Math.hypot(r.x - oCx, r.y - oCy);
+                      bad = err > 0.12 * oR || Math.abs(dist - oR) > 0.2 * oR;
+                  } else {
+                      double dist = Math.hypot(r.x - ocx, r.y - ocy);
+                      bad = dist < 0.5 * oR || dist > 1.7 * oR;
+                  }
+                  if (bad) {
+                      if (++missCount >= 2) endOrbit(tc);
+                      return;
+                  }
+                  missCount = 0;
+                  // keep the star centre fresh
+                  int bi = -1;
+                  double bd = 0.35 * oR;
+                  for (int i = 0; i < r.starCount; i++) {
+                      double d = Math.hypot(r.stars[2 * i] - ocx, r.stars[2 * i + 1] - ocy);
+                      if (d < bd) { bd = d; bi = i; }
+                  }
+                  if (bi >= 0) {
+                      ocx += 0.1 * (r.stars[2 * bi] - ocx);
+                      ocy += 0.1 * (r.stars[2 * bi + 1] - ocy);
+                  }
+                  addSample(tc, r);
                   fit(tc);
               }
 
-              private void addSample(double tc, Detector.Result r, double measTheta) {
-                  double phi = Math.atan2(r.y - ocy, r.x - ocx);
-                  if (n == 0) phiUnw = phi; else phiUnw += wrap(phi - phiPrev);
-                  phiPrev = phi;
+              private void endOrbit(double tc) {
+                  if (orbitActive && haveFit && tc - orbitStartT > 500 && Math.abs(oOm) > 0) {
+                      records.add(new double[]{oR / w, oOm, Math.abs(oOm) * oR / w, (tc - orbitStartT) / 1000.0});
+                      if (records.size() > 20) records.poll();
+                  }
+                  orbitActive = false;
+                  haveFit = false;
+                  centreFromPath = false;
+                  pathSince = -1;
+                  runCount = 0;
+                  missCount = 0;
+                  n = 0;
+                  targetKnown = false;
+                  locked = false;
+              }
+
+              private void addSample(double tc, Detector.Result r) {
                   int drop = 0;
                   while (drop < n && tc - bt[drop] > WINDOW_MS) drop++;
                   if (n - drop >= CAP) drop = n - CAP + 1;
                   if (drop > 0) {
                       System.arraycopy(bt, drop, bt, 0, n - drop);
-                      System.arraycopy(bphi, drop, bphi, 0, n - drop);
-                      System.arraycopy(bth, drop, bth, 0, n - drop);
                       System.arraycopy(bx, drop, bx, 0, n - drop);
                       System.arraycopy(by, drop, by, 0, n - drop);
                       n -= drop;
                   }
-                  bt[n] = tc;
-                  bphi[n] = phiUnw;
-                  bth[n] = measTheta;
-                  bx[n] = r.x;
-                  by[n] = r.y;
+                  bt[n] = tc; bx[n] = r.x; by[n] = r.y;
                   n++;
               }
 
-              /** Least-squares line through the unwrapped orbit angle: slope = angular speed. */
-              private void fit(double tc) {
-                  fitValid = false;
-                  if (!orbitFit || n < 6 || bt[n - 1] - bt[0] < 150) return;
+              private double meanDist(double cx, double cy) {
+                  double s = 0;
+                  for (int i = 0; i < n; i++) s += Math.hypot(bx[i] - cx, by[i] - cy);
+                  return s / n;
+              }
 
-                  // Centre of the path: fit a circle to the sprite's own positions when it has gone far enough
-                  // around (a star-centre detection can be a few pixels off, which would bend the fit).
+              /** Circle + constant angular speed through the last second of sprite positions. */
+              private void fit(double tc) {
+                  if (n < 6 || bt[n - 1] - bt[0] < 150) return;
+                  centreFromPath = false;
+
+                  // centre: the star centre first; once the sprite has gone far enough around, the circle through its own positions
                   double cx = ocx, cy = ocy;
-                  if (Math.abs(bphi[n - 1] - bphi[0]) > 1.8 && circleFit(cf)) {
-                      if (Math.hypot(cf[0] - ocx, cf[1] - ocy) < 0.4 * orbitR && cf[2] > 0.7 * orbitR && cf[2] < 1.3 * orbitR) {
+                  double prev = Math.atan2(by[0] - cy, bx[0] - cx), span = 0;
+                  for (int i = 1; i < n; i++) {
+                      double a = Math.atan2(by[i] - cy, bx[i] - cx);
+                      span += wrap(a - prev);
+                      prev = a;
+                  }
+                  if (Math.abs(span) > 1.6 && circleFit(cf)) {
+                      double md = meanDist(cx, cy);
+                      if (Math.hypot(cf[0] - ocx, cf[1] - ocy) < 0.45 * md && cf[2] > 0.6 * md && cf[2] < 1.4 * md) {
                           cx = cf[0];
                           cy = cf[1];
+                          centreFromPath = true;
                       }
                   }
+
                   double prevA = 0;
                   for (int i = 0; i < n; i++) {
                       double a = Math.atan2(by[i] - cy, bx[i] - cx);
@@ -848,7 +921,7 @@ jobs:
                       }
                       double rms = Math.sqrt(ss / cnt);
                       if (pass == 0) {
-                          double thr = Math.max(2.5 * rms, 0.04);       // drop outliers once, then refit
+                          double thr = Math.max(2.5 * rms, 0.04);
                           for (int i = 0; i < n; i++) {
                               double res = tphi[i] - (icpt + slope * (bt[i] - tc) / 1000.0);
                               if (Math.abs(res) > thr) keep[i] = false;
@@ -857,30 +930,36 @@ jobs:
                           return;
                       }
                   }
-                  if (Math.abs(slope) < 0.8 || Math.abs(slope) > 12) return;
-                  double s = slope > 0 ? 1 : -1;
-                  double rs = 0, sn = 0, cs = 0;
-                  int rc = 0, dc = 0;
+                  if (Math.abs(slope) < 0.5 || Math.abs(slope) > 14) return;
+                  double rs = 0;
+                  int rc = 0;
                   for (int i = 0; i < n; i++) {
                       if (!keep[i]) continue;
-                      rs += Math.hypot(bx[i] - cx, by[i] - cy); rc++;
-                      if (!Double.isNaN(bth[i])) {
-                          double dlt = wrap(bth[i] - s * HALF_PI - (icpt + slope * (bt[i] - tc) / 1000.0));
-                          sn += Math.sin(dlt); cs += Math.cos(dlt); dc++;
-                      }
+                      rs += Math.hypot(bx[i] - cx, by[i] - cy);
+                      rc++;
                   }
                   if (rc < 5) return;
-                  fitR = rs / rc;
-                  fitCx = cx;
-                  fitCy = cy;
-                  fitDelta = dc >= 3 ? Math.atan2(sn, cs) : 0;     // averaged facing-vs-tangent offset (also absorbs star-centre error)
-                  fitPhi = wrap(icpt);
-                  fitOm = slope;
-                  fitS = s;
-                  fitValid = true;
-                  orbitR += 0.1 * (fitR - orbitR);
-                  if (orbitR < 0.8 * r0) orbitR = 0.8 * r0;
-                  if (orbitR > 1.2 * r0) orbitR = 1.2 * r0;
+                  double R = rs / rc;
+
+                  double phiNow = wrap(icpt);
+                  boolean reset = !haveFit || (slope > 0) != (oOm > 0);
+                  if (!reset) {
+                      double pred = oPhi + oOm * (tc - oT) / 1000.0;
+                      if (Math.abs(wrap(phiNow - pred)) > 0.6) reset = true;
+                  }
+                  if (reset) {
+                      oCx = cx; oCy = cy; oR = R; oOm = slope; oPhi = phiNow; oT = tc;
+                      haveFit = true;
+                  } else {
+                      // blend: the circle and speed barely change, so single frames cannot shake the line
+                      double pred = oPhi + oOm * (tc - oT) / 1000.0;
+                      oPhi = wrap(pred + 0.3 * wrap(phiNow - pred));
+                      oT = tc;
+                      oOm += 0.2 * (slope - oOm);
+                      oCx += 0.2 * (cx - oCx);
+                      oCy += 0.2 * (cy - oCy);
+                      oR += 0.2 * (R - oR);
+                  }
               }
 
               /** Algebraic least-squares circle through the stored sprite positions. out = {cx, cy, radius}. */
@@ -905,51 +984,93 @@ jobs:
                   return true;
               }
 
-              /** Where the sprite will be, and which way it will face, leadS seconds after the latest frame. */
-              private void predict(double leadS, double[] o) {
-                  if (fitValid) {
-                      double p = fitPhi + fitOm * leadS;
-                      o[0] = fitCx + fitR * Math.cos(p);
-                      o[1] = fitCy + fitR * Math.sin(p);
-                      o[2] = p + fitS * HALF_PI + fitDelta;
-                  } else {
-                      o[0] = x + vx * leadS;
-                      o[1] = y + vy * leadS;
-                      o[2] = th + om * leadS;
-                  }
+              // ------------------------------------------------------------------ target and release time
+
+              /**
+               * Cross product of the heading with the direction to the target, for a sprite at orbit phase phi.
+               * Zero means the heading points straight at the target. dot[0] receives the distance along the heading.
+               */
+              private static double miss(double cx, double cy, double R, double s, double trim,
+                                         double tx, double ty, double phi, double[] dot) {
+                  double px = cx + R * Math.cos(phi), py = cy + R * Math.sin(phi);
+                  double psi = phi + s * HALF_PI + trim;
+                  double dx = Math.cos(psi), dy = Math.sin(psi);
+                  double rx = tx - px, ry = ty - py;
+                  dot[0] = rx * dx + ry * dy;
+                  return rx * dy - ry * dx;
               }
 
-              private final double[] pred = new double[3];
+              /**
+               * How many radians the sprite still has to travel (in its direction of travel) before leaving along
+               * its heading hits the target dead centre. NaN if it never does. With no trim this equals the closed form
+               * phi = atan2(T - C) - s * acos(R / |T - C|).
+               */
+              static double solveRelease(double cx, double cy, double R, double s, double trim,
+                                         double tx, double ty, double phi0) {
+                  final int steps = 144;
+                  final double h = 2 * Math.PI / steps;
+                  double[] dot = new double[1];
+                  double prevF = miss(cx, cy, R, s, trim, tx, ty, phi0, dot);
+                  double prevA = 0;
+                  for (int k = 1; k <= steps; k++) {
+                      double a = k * h;
+                      double f = miss(cx, cy, R, s, trim, tx, ty, phi0 + s * a, dot);
+                      if ((prevF < 0 && f >= 0) || (prevF > 0 && f <= 0)) {
+                          double lo = prevA, hi = a, flo = prevF;
+                          for (int it = 0; it < 30; it++) {
+                              double mid = 0.5 * (lo + hi);
+                              double fm = miss(cx, cy, R, s, trim, tx, ty, phi0 + s * mid, dot);
+                              if ((flo < 0) == (fm < 0)) { lo = mid; flo = fm; } else hi = mid;
+                          }
+                          double root = 0.5 * (lo + hi);
+                          miss(cx, cy, R, s, trim, tx, ty, phi0 + s * root, dot);
+                          if (dot[0] > 0.5 * R) return root;
+                      }
+                      prevF = f;
+                      prevA = a;
+                  }
+                  return Double.NaN;
+              }
 
-              private void findTarget(double tc, Detector.Result r) {
+              private void chooseTarget(double tc, long arrivalMs, Detector.Result r) {
                   locked = false;
-                  if (!orbitActive) return;
-                  predict(tapLeadMs / 1000.0, pred);
-                  double fx = pred[0], fy = pred[1], fth = pred[2];
-                  double ux = Math.cos(fth), uy = Math.sin(fth);
-                  double om2 = fitValid ? fitOm : om;
-                  int hit = -1;
-                  double hitT = 1e18, hitD = 0, hitEps = 0;
+                  if (!orbitActive || !haveFit) { targetKnown = false; return; }
+                  // the next circle = the nearest star above the one being circled
+                  int best = -1;
+                  double bestD = 1e18;
                   for (int j = 0; j < r.starCount; j++) {
                       double sx = r.stars[2 * j], sy = r.stars[2 * j + 1];
-                      if (Math.hypot(sx - ocx, sy - ocy) < 0.5 * orbitR) continue;      // the star we are circling
-                      double rx = sx - fx, ry = sy - fy;
-                      double t = rx * ux + ry * uy;
-                      if (t < 0.5 * orbitR) continue;
-                      double d = Math.abs(rx * uy - ry * ux);
-                      if (d < 0.95 * orbitR && t < hitT) { hit = j; hitT = t; hitD = d; hitEps = wrap(Math.atan2(ry, rx) - fth); }
+                      double d = Math.hypot(sx - oCx, sy - oCy);
+                      if (d < 1.12 * oR) continue;                 // the star we are circling, or too close for a tangent to reach
+                      if (sy > oCy - 0.3 * oR) continue;           // only circles above
+                      if (d < bestD) { bestD = d; best = j; }
                   }
-                  if (hit >= 0 && hitD < HIT_K * orbitR && r.stars[2 * hit + 1] < ocy - 0.3 * orbitR) {
-                      locked = true;
-                      tx = r.stars[2 * hit];
-                      ty = r.stars[2 * hit + 1];
+                  if (best < 0) { targetKnown = false; return; }
+                  double sx = r.stars[2 * best], sy = r.stars[2 * best + 1];
+                  if (targetKnown && Math.hypot(sx - tx, sy - ty) < 0.3 * oR) {
+                      tx += 0.3 * (sx - tx);
+                      ty += 0.3 * (sy - ty);
+                  } else {
+                      tx = sx; ty = sy; targetKnown = true;
                   }
-                  // tap when the line is closest to the middle of the target: within half a frame step of crossing it
-                  boolean centred = locked && Math.abs(hitEps) <= Math.max(0.5 * Math.abs(om2) * dtFrame, 0.03);
-                  boolean steady = fitValid || lastInnovationOk;
-                  if (centred && autoTap && steady && tc - tFire > COOLDOWN_MS) {
-                      fire = true;
-                      tFire = tc;
+
+                  double s = oOm > 0 ? 1 : -1;
+                  double phiNow = oPhi + oOm * (tc - oT) / 1000.0;
+                  double ahead = solveRelease(oCx, oCy, oR, s, Math.toRadians(trimDeg), tx, ty, phiNow);
+                  if (Double.isNaN(ahead)) return;
+                  double tRel = tc + ahead / Math.abs(oOm) * 1000.0;     // when the sprite faces the target dead on
+                  locked = tRel - tc < 300;
+
+                  // only tap once the circle comes from the sprite's own path (not just the star centre) and has settled
+                  if (centreFromPath) { if (pathSince < 0) pathSince = tc; } else pathSince = -1;
+                  boolean steady = pathSince >= 0 && tc - pathSince > 150 && n >= 8 && clockFrames > 45;
+                  double tAt = tRel - tapLeadMs;
+                  double inMs = tAt - arrivalMs;
+                  // a tap that would be more than a hair late waits for the next pass instead of landing off-line
+                  if (autoTap && steady && inMs <= 90 && inMs >= -12 && tc - tFire > 500) {
+                      fireAtMs = Math.max(tAt, (double) arrivalMs);
+                      tFire = fireAtMs;
+                      tReleaseExp = tRel;
                   }
               }
 
@@ -957,16 +1078,18 @@ jobs:
                   Snapshot s = new Snapshot();
                   s.t = tLast;
                   s.visible = has;
+                  s.x = (float) x; s.y = (float) y; s.theta = (float) thFly;
+                  s.vx = (float) vx; s.vy = (float) vy; s.tip = (float) tip;
+                  s.hasTarget = orbitActive && targetKnown;
                   s.locked = locked;
-                  s.x = (float) x; s.y = (float) y; s.theta = (float) th;
-                  s.vx = (float) vx; s.vy = (float) vy; s.omega = (float) om;
-                  s.tip = (float) tip;
-                  s.tx = tx; s.ty = ty; s.tr = (float) orbitR;
-                  if (orbitActive && fitValid) {
+                  s.tx = (float) tx; s.ty = (float) ty; s.tr = (float) (haveFit ? oR : r0);
+                  if (orbitActive && haveFit) {
                       s.orbit = true;
-                      s.ocx = (float) fitCx; s.ocy = (float) fitCy; s.oR = (float) fitR;
-                      s.oPhi = (float) fitPhi; s.oOmega = (float) fitOm;
-                      s.oDelta = (float) fitDelta; s.oSign = (float) fitS;
+                      s.t = oT;
+                      s.ocx = (float) oCx; s.ocy = (float) oCy; s.oR = (float) oR;
+                      s.oPhi = (float) oPhi; s.oOmega = (float) oOm;
+                      s.oTrim = (float) Math.toRadians(trimDeg);
+                      if (tReleaseExp > 0 && tLast - tFire < 700) s.hideFrom = tReleaseExp + 50;
                   }
                   return s;
               }
@@ -1016,11 +1139,17 @@ jobs:
                   style = Paint.Style.STROKE
                   strokeWidth = 5f
               }
+              private val ringDim = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.argb(110, 0, 210, 90)
+                  style = Paint.Style.STROKE
+                  strokeWidth = 3f
+              }
 
               override fun onDraw(canvas: Canvas) {
                   val s = snap ?: return
                   val now = SystemClock.uptimeMillis()
                   if (!s.visible || now - s.t > 400) return
+                  if (s.orbit && now >= s.hideFrom) return      // the tap has just released the sprite: the orbit line is over
                   s.at(now, leadMs, pos)
 
                   // draw in true screen coordinates even if the system offsets this window (insets, cutouts)
@@ -1034,7 +1163,7 @@ jobs:
                   val y0 = pos[1] + uy * s.tip
                   val len = hypot(width.toFloat(), height.toFloat())
                   canvas.drawLine(x0, y0, x0 + ux * len, y0 + uy * len, if (s.locked) lockPaint else paint)
-                  if (s.locked) canvas.drawCircle(s.tx, s.ty, s.tr, ringPaint)
+                  if (s.hasTarget) canvas.drawCircle(s.tx, s.ty, s.tr, if (s.locked) ringPaint else ringDim)
                   canvas.restore()
                   postInvalidateOnAnimation()
               }
@@ -1071,12 +1200,19 @@ jobs:
               }
 
               fun tap(x: Float, y: Float) {
-                  main.post {
-                      val path = Path().apply { moveTo(x, y) }
-                      val stroke = GestureDescription.StrokeDescription(path, 0L, 35L)
-                      val gesture = GestureDescription.Builder().addStroke(stroke).build()
-                      dispatchGesture(gesture, null, null)
-                  }
+                  main.post { dispatch(x, y) }
+              }
+
+              /** Sends the tap at an exact moment (SystemClock.uptimeMillis timeline), not "as soon as possible". */
+              fun tapAt(x: Float, y: Float, uptimeMs: Long) {
+                  main.postAtTime({ dispatch(x, y) }, uptimeMs)
+              }
+
+              private fun dispatch(x: Float, y: Float) {
+                  val path = Path().apply { moveTo(x, y) }
+                  val stroke = GestureDescription.StrokeDescription(path, 0L, 35L)
+                  val gesture = GestureDescription.Builder().addStroke(stroke).build()
+                  dispatchGesture(gesture, null, null)
               }
 
               companion object {
@@ -1204,8 +1340,12 @@ jobs:
 
                           val res = detector.detect(bytes, plane.rowStride)
                           view.snap = engine.update(now, image.timestamp, res).scaled(fx, fy)
-                          if (engine.fire) {
-                              TapService.instance?.tap(sw * 0.5f, sh * 0.6f)
+                          if (engine.fireAtMs >= 0) {
+                              TapService.instance?.tapAt(sw * 0.5f, sh * 0.6f, engine.fireAtMs.toLong())
+                          }
+                          while (true) {
+                              val rec = engine.pollRecord() ?: break
+                              OrbitLog.add(applicationContext, rec)
                           }
                           view.postInvalidate()
                       } finally {
@@ -1231,6 +1371,91 @@ jobs:
 
               companion object {
                   const val ACTION_STOP = "com.example.aimline.STOP"
+              }
+          }
+          AIMLINE_EOF
+          cat > app/src/main/java/com/example/aimline/OrbitLog.kt <<'AIMLINE_EOF'
+          package com.example.aimline
+
+          import android.content.Context
+          import java.io.File
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import kotlin.math.abs
+          import kotlin.math.exp
+          import kotlin.math.ln
+
+          /**
+           * Remembers every circle the sprite orbits: how big it was and how fast the sprite went round.
+           * Written by the overlay service, shown (and copied / shared) on the main screen.
+           */
+          object OrbitLog {
+              private const val FILE = "orbits.csv"
+              private const val MAX_ROWS = 300
+              private const val HEADER = "time,radius_pct_of_width,omega_rad_per_s,speed_widths_per_s,seconds_in_circle"
+
+              private fun file(c: Context) = File(c.filesDir, FILE)
+
+              @Synchronized
+              private fun rows(c: Context): MutableList<String> {
+                  val f = file(c)
+                  if (!f.exists()) return mutableListOf()
+                  return f.readLines().filter { it.isNotBlank() && it != HEADER }.toMutableList()
+              }
+
+              /** rec = {radius / frame width, signed rad/s, speed in frame widths/s, seconds in the circle} */
+              @Synchronized
+              fun add(c: Context, rec: DoubleArray) {
+                  val rows = rows(c)
+                  val time = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+                  rows.add(String.format(Locale.US, "%s,%.2f,%.3f,%.3f,%.1f", time, rec[0] * 100, rec[1], rec[2], rec[3]))
+                  while (rows.size > MAX_ROWS) rows.removeAt(0)
+                  file(c).writeText((listOf(HEADER) + rows).joinToString("\n") + "\n")
+              }
+
+              @Synchronized
+              fun clear(c: Context) {
+                  file(c).delete()
+              }
+
+              fun recent(c: Context, n: Int): String {
+                  val r = rows(c)
+                  if (r.isEmpty()) return "(no circles logged yet)"
+                  return (listOf("time      R%w   rad/s  w/s   sec") + r.takeLast(n).map { it.replace(",", "  ") }).joinToString("\n")
+              }
+
+              /** Plain-language reading of the log: how the speed changes with the radius. */
+              fun summary(c: Context): String {
+                  val d = rows(c).mapNotNull { row ->
+                      val p = row.split(",")
+                      if (p.size < 5) null else doubleArrayOf(p[1].toDouble(), abs(p[2].toDouble()), p[3].toDouble())
+                  }
+                  if (d.size < 3) return "Circles logged: ${d.size}. Play a few more (ideally of different sizes)."
+                  val rMin = d.minOf { it[0] }
+                  val rMax = d.maxOf { it[0] }
+                  val head = String.format(Locale.US, "Circles logged: %d, radius %.1f-%.1f%% of width.", d.size, rMin, rMax)
+                  if (rMax / rMin < 1.15) return "$head\nAll circles are about the same size, so there is nothing to compare yet."
+                  var sx = 0.0; var sy = 0.0; var sxx = 0.0; var sxy = 0.0
+                  for (v in d) {
+                      val x = ln(v[0]); val y = ln(v[1])
+                      sx += x; sy += y; sxx += x * x; sxy += x * y
+                  }
+                  val n = d.size.toDouble()
+                  val a = (n * sxy - sx * sy) / (n * sxx - sx * sx)
+                  val k = exp((sy - a * sx) / n)
+                  val meaning = when {
+                      a < -0.75 && a > -1.25 -> "the sprite moves at about the same speed along every circle (small circles spin faster)"
+                      a > -0.25 && a < 0.25 -> "the sprite turns at about the same rate on every circle"
+                      else -> "speed depends on the radius in a mixed way"
+                  }
+                  return String.format(Locale.US, "%s\nFit: omega = %.2f x R^%.2f (R in %% of width) -> %s.", head, k, a, meaning)
+              }
+
+              /** Everything, as text to paste or share. */
+              fun export(c: Context): String {
+                  val r = rows(c)
+                  return summary(c) + "\n\n" + HEADER + "\n" + r.joinToString("\n")
               }
           }
           AIMLINE_EOF
