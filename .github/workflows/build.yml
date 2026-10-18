@@ -39,8 +39,8 @@ jobs:
                   applicationId = "com.example.aimline"
                   minSdk = 30
                   targetSdk = 34
-                  versionCode = 7
-                  versionName = "3.3"
+                  versionCode = 8
+                  versionName = "3.4"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -140,8 +140,12 @@ jobs:
                   }
 
                   col.addView(TextView(this).apply {
-                      text = "Aim Line v3.3"
+                      text = "Aim Line v3.4"
                       textSize = 20f
+                  })
+                  col.addView(TextView(this).apply {
+                      text = "Orange line = aiming. Green = locked on the next circle. Red = the crab will be in the way, so the auto-tap waits for the next round."
+                      textSize = 12f
                   })
 
                   fun button(label: String, action: () -> Unit) {
@@ -198,6 +202,7 @@ jobs:
                   slider(col, prefs, "Line lead (raise if the line lags behind the sprite)", "lead", 0, 150, 65, " ms")
                   slider(col, prefs, "Tap lead (raise if taps land late, lower if early)", "taplead", 0, 250, 110, " ms")
                   slider(col, prefs, "Angle trim (only if the line is always rotated the same way)", "trim", -15, 15, 0, "\u00B0")
+                  slider(col, prefs, "Crab safety (0 = ignore the crab; raise if the sprite still hits it, lower if too many taps are skipped)", "crab", 0, 100, 40, " %")
 
                   // ---- circle log
                   col.addView(TextView(this).apply {
@@ -295,6 +300,7 @@ jobs:
            * A real star core is a lattice of many SMALL SEPARATE dots. Things that only look dense are rejected:
            * the bold points dots on the path and the dots of the score digits (each one solid blob), and the crab
            * (a solid blob, or a big filled coloured sprite). See coreMass() and findColouredSprites().
+           * The boxes of the coloured sprites (the crab) are also handed back in Result.crabs, so the engine can follow them.
            *
            * The game has a white theme and a dark theme (everything's brightness swapped). Each frame the most common
            * brightness (= the background) is checked; in the dark theme the brightness of every pixel is flipped first,
@@ -315,6 +321,8 @@ jobs:
                   public float[] stars = new float[0];   // x0,y0,x1,y1,...
                   public float[] starSize = new float[0];// one per star: amount of dark ink in its core (bigger circle = bigger number)
                   public int starCount;
+                  public float[] crabs = new float[0];   // x0,y0,x1,y1 of every big filled coloured sprite (the crab), frame px
+                  public int crabCount;
               }
 
               private static final int DARK = 60;
@@ -620,6 +628,9 @@ jobs:
                       }
                   }
                   findColouredSprites();
+                  res.crabCount = sprN;
+                  res.crabs = new float[sprN * 4];
+                  for (int i = 0; i < sprN * 4; i++) res.crabs[i] = spr[i];
                   float[] pts = new float[MAX_STARS * 2];
                   float[] sizes = new float[MAX_STARS];
                   int count = 0;
@@ -772,6 +783,11 @@ jobs:
            * which leaving along the tangent passes through the middle of the next circle, converts it into a
            * time with the fitted speed, and the service sends the tap at exactly that time (minus the tap lead).
            *
+           * Crab: the crab walks left and right all the time, so it can step into the path AFTER the shot has been fired.
+           * Every crab is followed (position, walking speed, turning points). For the coming shot the engine looks at where the crab
+           * WILL BE at the moment the sprite flies past each point of the path. If it would be in the way, the tap is not sent
+           * (the sprite goes round once more and the check is made again for the next pass) and the line turns red.
+           *
            * Positions are capture-frame pixels, times are milliseconds on the uptime clock.
            */
           public final class AimEngine {
@@ -779,7 +795,7 @@ jobs:
               /** State handed to the overlay view, which evaluates it on every screen refresh. */
               public static final class Snapshot {
                   public double t;                         // capture time this state belongs to
-                  public boolean visible, orbit, hasTarget, locked;
+                  public boolean visible, orbit, hasTarget, locked, blocked;
                   public float x, y, theta, vx, vy, tip;   // flight state (used when not orbit)
                   public float tx, ty, tr;                 // target circle
                   public float ocx, ocy, oR, oPhi, oOmega, oTrim;   // fitted orbit (used when orbit)
@@ -787,7 +803,7 @@ jobs:
 
                   public Snapshot scaled(float fx, float fy) {
                       Snapshot s = new Snapshot();
-                      s.t = t; s.visible = visible; s.orbit = orbit; s.hasTarget = hasTarget; s.locked = locked;
+                      s.t = t; s.visible = visible; s.orbit = orbit; s.hasTarget = hasTarget; s.locked = locked; s.blocked = blocked;
                       s.x = x * fx; s.y = y * fy; s.theta = theta; s.vx = vx * fx; s.vy = vy * fy; s.tip = tip * fx;
                       s.tx = tx * fx; s.ty = ty * fy; s.tr = tr * fx;
                       s.ocx = ocx * fx; s.ocy = ocy * fy; s.oR = oR * fx;
@@ -819,6 +835,7 @@ jobs:
               public float tapLeadMs = 110f;
               public float trimDeg = 0f;
               public boolean autoTap = false;
+              public float crabSafety = 1f;      // 0 = ignore the crab, 1 = normal, more = keeps a bigger distance from it
 
               /** Set by update(): uptime (ms) at which a tap must be sent, or -1 for none. */
               public double fireAtMs = -1;
@@ -830,6 +847,8 @@ jobs:
               private static final double TURN_MIN = 8.5;       // radians of travel needed before auto-tap trusts a small or fast circle
               private static final double SIZE_TIE = 0.90;      // circles within 10% of the biggest size count as equally big (then the nearer one wins)
               private static final double KEEP_MARGIN = 1.20;   // the current target is kept unless another circle is more than 20% bigger
+              private static final double CRAB_KEEP_MS = 600;   // a crab not seen for this long is forgotten (until then it keeps walking on in the prediction)
+              private static final int MAX_CRABS = 8;
 
               private final int w;
               private final double r0;                         // typical orbit radius, only used as a size reference
@@ -870,6 +889,18 @@ jobs:
 
               // ---- per-circle records for the log
               private final ArrayDeque<double[]> records = new ArrayDeque<>();
+
+              // ---- crabs: big filled coloured sprites that walk left and right and kill the sprite on touch
+              private static final class Crab {
+                  double x, y, vx, vy, hw, hh, seen, peak;
+                  double lo = Double.NaN, hi = Double.NaN;     // left / right turning points, known once the crab has been seen turning round
+                  int dir, frames;
+                  boolean upd;
+              }
+              private final java.util.ArrayList<Crab> crabs = new java.util.ArrayList<>();
+              private double flightSpd;       // learned speed of the sprite while it flies between circles (frame px per second)
+              private double sprR;            // half size of the sprite (frame px)
+              private boolean blocked;        // a crab is expected on the path of the next shot
 
               public AimEngine(int frameWidth) {
                   w = frameWidth;
@@ -914,6 +945,7 @@ jobs:
                   double dt = has ? (tc - tLast) / 1000.0 : 0;
                   if (has && (dt > 0.25 || dt < 0)) { has = false; endOrbit(tc); dt = 0; }
                   track(dt, r);
+                  updateCrabs(tc, r);
                   tLast = tc;
                   tSeen = tc;
                   addFree(tc, r.x, r.y);
@@ -972,6 +1004,11 @@ jobs:
                       thFly = thShape;
                   }
                   tip += 0.05 * (r.tip - tip);
+                  // learn how fast the sprite flies between circles (only while it is not on a circle)
+                  if (!orbitActive && moving) {
+                      double sp = Math.hypot(vx, vy);
+                      if (sp > 0.2 * w && sp < 4 * w) flightSpd = flightSpd == 0 ? sp : flightSpd + (sp > flightSpd ? 0.3 : 0.02) * (sp - flightSpd);
+                  }
               }
 
               // ------------------------------------------------------------------ orbit
@@ -1316,6 +1353,7 @@ jobs:
 
               private void chooseTarget(double tc, long arrivalMs, Detector.Result r) {
                   locked = false;
+                  blocked = false;
                   if (!orbitActive || !haveFit) { targetKnown = false; return; }
                   // The circles in front = every real circle above the one being orbited (the detector has already thrown out the
                   // crab, the bold points dots and the score digits). Jump only to the BIGGEST of them, not the nearest.
@@ -1355,6 +1393,13 @@ jobs:
                   double tRel = tc + ahead / Math.abs(oOm) * 1000.0;     // when the sprite faces the target dead on
                   locked = tRel - tc < 300;
 
+                  // Will a crab be on the path of this shot? Not "is it there now" but "will it be there when the sprite flies past".
+                  double phiRel = phiNow + s * ahead;
+                  double relX = oCx + oR * Math.cos(phiRel), relY = oCy + oR * Math.sin(phiRel);
+                  double psiRel = phiRel + s * HALF_PI + Math.toRadians(trimDeg);
+                  double flyD = Math.hypot(tx - relX, ty - relY);
+                  blocked = crabInPath(tc, tRel, relX, relY, Math.cos(psiRel), Math.sin(psiRel), Math.max(0.35 * flyD, flyD - 0.6 * oR));
+
                   // only tap once the circle comes from the sprite's own path (not just the star centre) and has settled
                   if (centreFromPath) { if (pathSince < 0) pathSince = tc; } else pathSince = -1;
                   boolean steady = pathSince >= 0 && tc - pathSince > 150 && n >= 8 && clockFrames > 45;
@@ -1362,12 +1407,115 @@ jobs:
                   if ((oR < 0.7 * r0 || Math.abs(oOm) > 6) && Math.abs(oOm) * (tc - orbitStartT) / 1000.0 < TURN_MIN) steady = false;
                   double tAt = tRel - tapLeadMs;
                   double inMs = tAt - arrivalMs;
-                  // a tap that would be more than a hair late waits for the next pass instead of landing off-line
-                  if (autoTap && steady && inMs <= 90 && inMs >= -12 && tc - tFire > 500) {
+                  // a tap that would be more than a hair late waits for the next pass instead of landing off-line;
+                  // a shot with a crab in the way is skipped the same way (the sprite simply goes round once more)
+                  if (autoTap && steady && !blocked && inMs <= 90 && inMs >= -12 && tc - tFire > 500) {
                       fireAtMs = Math.max(tAt, (double) arrivalMs);
                       tFire = fireAtMs;
                       tReleaseExp = tRel;
                   }
+              }
+
+              // ------------------------------------------------------------------ crabs
+
+              /** Follows every crab (big filled coloured sprite): where it is, which way it walks, how fast, and where it turns round. */
+              private void updateCrabs(double tc, Detector.Result r) {
+                  double sz = Math.min(0.04 * w, 0.5 * Math.max(r.bx1 - r.bx0, r.by1 - r.by0));
+                  sprR = sprR == 0 ? sz : sprR + 0.1 * (sz - sprR);
+                  for (int i = crabs.size() - 1; i >= 0; i--) {
+                      if (tc - crabs.get(i).seen > CRAB_KEEP_MS) crabs.remove(i);
+                      else crabs.get(i).upd = false;
+                  }
+                  for (int j = 0; j < r.crabCount; j++) {
+                      double cx = 0.5 * (r.crabs[4 * j] + r.crabs[4 * j + 2] + 1), cy = 0.5 * (r.crabs[4 * j + 1] + r.crabs[4 * j + 3] + 1);
+                      double hw = 0.5 * (r.crabs[4 * j + 2] - r.crabs[4 * j] + 1), hh = 0.5 * (r.crabs[4 * j + 3] - r.crabs[4 * j + 1] + 1);
+                      Crab best = null;
+                      double bd = 1e18;
+                      for (Crab c : crabs) {
+                          if (c.upd) continue;
+                          double gap = (tc - c.seen) / 1000.0;
+                          double d = Math.hypot(cx - (c.x + c.vx * gap), cy - (c.y + c.vy * gap));
+                          if (d < bd) { bd = d; best = c; }
+                      }
+                      if (best == null || bd > 0.1 * w + 0.3 * Math.hypot(best.vx, best.vy) * (tc - best.seen) / 1000.0) {
+                          if (crabs.size() < MAX_CRABS) {                       // a crab we have not followed yet
+                              Crab c = new Crab();
+                              c.x = cx; c.y = cy; c.hw = hw; c.hh = hh; c.seen = tc; c.upd = true; c.frames = 1;
+                              crabs.add(c);
+                          }
+                          continue;
+                      }
+                      double el = (tc - best.seen) / 1000.0;
+                      if (el > 0.004) {
+                          double a = best.frames < 2 ? 0.6 : Math.min(0.5, 10 * el);
+                          best.vx += a * ((cx - best.x) / el - best.vx);
+                          best.vy += a * ((cy - best.y) / el - best.vy);
+                      }
+                      best.x = cx; best.y = cy;
+                      best.hw += 0.3 * (hw - best.hw);
+                      best.hh += 0.3 * (hh - best.hh);
+                      best.seen = tc; best.upd = true; best.frames++;
+                      // which way it walks, and where it turns round (the furthest point it reached before turning)
+                      int nd = best.vx > 0.08 * w ? 1 : best.vx < -0.08 * w ? -1 : 0;
+                      if (nd != 0) {
+                          if (best.dir == 0) best.peak = cx;
+                          else if (nd != best.dir) {
+                              if (nd < 0) best.hi = best.peak; else best.lo = best.peak;
+                              best.peak = cx;
+                          }
+                          best.dir = nd;
+                      }
+                      if (best.dir > 0) best.peak = Math.max(best.peak, cx);
+                      else if (best.dir < 0) best.peak = Math.min(best.peak, cx);
+                  }
+              }
+
+              /** Where a crab will be dt seconds after it was last seen: it keeps walking, and bounces off its turning points once those are known. */
+              private double crabX(Crab c, double dt) {
+                  double px = c.x + c.vx * dt;
+                  boolean hasLo = !Double.isNaN(c.lo), hasHi = !Double.isNaN(c.hi);
+                  if (hasLo && hasHi && c.hi - c.lo > 0.1 * w) {
+                      double span = c.hi - c.lo;
+                      double u = (px - c.lo) % (2 * span);
+                      if (u < 0) u += 2 * span;
+                      return c.lo + (u <= span ? u : 2 * span - u);
+                  }
+                  if (c.vx > 0 && hasHi && px > c.hi) return 2 * c.hi - px;
+                  if (c.vx < 0 && hasLo && px < c.lo) return 2 * c.lo - px;
+                  return px;
+              }
+
+              /**
+               * True if a crab is expected on the path of a shot that leaves at time tRel from (px, py) along (ux, uy) for len pixels.
+               * Both cases are covered: a crab that is already on the path, and one that is still walking towards it.
+               * For every point of the path the engine works out when the sprite will be there, and looks at where the crab will be
+               * at that moment. The further ahead the guess, the wider the margin (crabSafety scales all margins; 0 = off).
+               */
+              private boolean crabInPath(double tc, double tRel, double px, double py, double ux, double uy, double len) {
+                  if (crabSafety <= 0 || crabs.isEmpty()) return false;
+                  double spd = flightSpd > 0 ? flightSpd : Math.max(Math.abs(oOm) * oR, 0.3 * w);   // until a flight has been seen: same speed as on the circle
+                  double step = Math.max(3.0, 0.015 * w);
+                  double safe = 0.008 * w * crabSafety;
+                  for (Crab c : crabs) {
+                      if (tc - c.seen > CRAB_KEEP_MS || c.frames < 2) continue;
+                      double mx = c.hw + sprR + safe, my = c.hh + sprR + safe;
+                      for (double d = 0; d <= len; d += step) {
+                          double qx = px + ux * d, qy = py + uy * d;
+                          double h = (tRel + d / spd * 1000.0 - c.seen) / 1000.0;     // seconds after the crab was last seen
+                          double sl = (0.06 + 0.15 * Math.max(h, 0)) * crabSafety;     // timing uncertainty grows with the distance ahead
+                          double xa = 1e18, xb = -1e18, ya = 1e18, yb = -1e18;
+                          for (int k = 0; k <= 4; k++) {
+                              double hk = Math.max(0, h - sl + k * sl / 2);
+                              double cxk = crabX(c, hk), cyk = c.y + c.vy * hk;
+                              if (cxk < xa) xa = cxk;
+                              if (cxk > xb) xb = cxk;
+                              if (cyk < ya) ya = cyk;
+                              if (cyk > yb) yb = cyk;
+                          }
+                          if (qx > xa - mx && qx < xb + mx && qy > ya - my && qy < yb + my) return true;
+                      }
+                  }
+                  return false;
               }
 
               private Snapshot snapshot() {
@@ -1378,6 +1526,7 @@ jobs:
                   s.vx = (float) vx; s.vy = (float) vy; s.tip = (float) tip;
                   s.hasTarget = orbitActive && targetKnown;
                   s.locked = locked;
+                  s.blocked = blocked && orbitActive && targetKnown;
                   s.tx = (float) tx; s.ty = (float) ty; s.tr = (float) (haveFit ? oR : r0);
                   if (orbitActive && haveFit) {
                       s.orbit = true;
@@ -1416,7 +1565,7 @@ jobs:
               private val pos = FloatArray(3)
               private val loc = IntArray(2)
 
-              // Orange / green are strongly coloured, so the detector (which only looks at grey pixels)
+              // Orange / green / red are strongly coloured, so the detector (which only looks at grey pixels)
               // never mistakes the overlay for the game's sprite or stars.
               private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                   color = Color.rgb(255, 120, 0)
@@ -1440,6 +1589,18 @@ jobs:
                   style = Paint.Style.STROKE
                   strokeWidth = 3f
               }
+              // red = a crab is expected on the path of the next shot
+              private val blockPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.rgb(230, 30, 30)
+                  strokeWidth = 9f
+                  strokeCap = Paint.Cap.ROUND
+                  pathEffect = DashPathEffect(floatArrayOf(1f, 20f), 0f)
+              }
+              private val ringBlock = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.rgb(230, 30, 30)
+                  style = Paint.Style.STROKE
+                  strokeWidth = 5f
+              }
 
               override fun onDraw(canvas: Canvas) {
                   val s = snap ?: return
@@ -1458,8 +1619,8 @@ jobs:
                   val x0 = pos[0] + ux * s.tip      // start at the nose, where the game's own line starts
                   val y0 = pos[1] + uy * s.tip
                   val len = hypot(width.toFloat(), height.toFloat())
-                  canvas.drawLine(x0, y0, x0 + ux * len, y0 + uy * len, if (s.locked) lockPaint else paint)
-                  if (s.hasTarget) canvas.drawCircle(s.tx, s.ty, s.tr, if (s.locked) ringPaint else ringDim)
+                  canvas.drawLine(x0, y0, x0 + ux * len, y0 + uy * len, if (s.blocked) blockPaint else if (s.locked) lockPaint else paint)
+                  if (s.hasTarget) canvas.drawCircle(s.tx, s.ty, s.tr, if (s.blocked) ringBlock else if (s.locked) ringPaint else ringDim)
                   canvas.restore()
                   postInvalidateOnAnimation()
               }
@@ -1632,6 +1793,7 @@ jobs:
                           engine.autoTap = prefs.getBoolean("auto", false)
                           engine.tapLeadMs = prefs.getInt("taplead", 110).toFloat()
                           engine.trimDeg = prefs.getInt("trim", 0).toFloat()
+                          engine.crabSafety = prefs.getInt("crab", 40) / 40f
                           view.leadMs = prefs.getInt("lead", 65).toFloat()
 
                           val res = detector.detect(bytes, plane.rowStride)
