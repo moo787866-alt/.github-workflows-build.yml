@@ -39,8 +39,8 @@ jobs:
                   applicationId = "com.example.aimline"
                   minSdk = 30
                   targetSdk = 34
-                  versionCode = 6
-                  versionName = "3.2"
+                  versionCode = 7
+                  versionName = "3.3"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -140,7 +140,7 @@ jobs:
                   }
 
                   col.addView(TextView(this).apply {
-                      text = "Aim Line v3.2"
+                      text = "Aim Line v3.3"
                       textSize = 20f
                   })
 
@@ -290,7 +290,11 @@ jobs:
            * Pure-Java frame analysis (no Android classes, so it can be tested on a desktop JVM).
            *
            * Finds (1) the player sprite: the largest solid near-black blob, its centre, and which way
-           * it faces, and (2) the star cores (dense clusters of dark dots) used as targets.
+           * it faces, and (2) the star cores (dense clusters of dark dots) used as targets, each with a size.
+           *
+           * A real star core is a lattice of many SMALL SEPARATE dots. Things that only look dense are rejected:
+           * the bold points dots on the path and the dots of the score digits (each one solid blob), and the crab
+           * (a solid blob, or a big filled coloured sprite). See coreMass() and findColouredSprites().
            *
            * The game has a white theme and a dark theme (everything's brightness swapped). Each frame the most common
            * brightness (= the background) is checked; in the dark theme the brightness of every pixel is flipped first,
@@ -309,6 +313,7 @@ jobs:
                   public float tip;             // distance from centre to the nose along the facing direction
                   public int bx0, by0, bx1, by1;
                   public float[] stars = new float[0];   // x0,y0,x1,y1,...
+                  public float[] starSize = new float[0];// one per star: amount of dark ink in its core (bigger circle = bigger number)
                   public int starCount;
               }
 
@@ -321,6 +326,20 @@ jobs:
               private static final int MAX_STARS = 12;
               private static final double STAR_DENSITY = 0.16;
 
+              // ---- what a real star core looks like (all sizes are relative to the frame width, so any screen works)
+              private static final double CORE_R_FRAC = 0.03;       // radius of the window that is inspected around a candidate
+              private static final int VERY_DARK = 100;             // brightness below which a pixel counts as "solid ink"
+              private static final double SOLID_FRAC = 0.000085;    // x w^2: one connected very-dark blob this big is a solid disc (points dot, score dot, crab), not one dot of a lattice
+              private static final int MIN_DOTS = 7;                // a lattice has at least this many separate dots
+              private static final double DOMINANT = 0.40;          // ...and no single blob may hold more than this share of the ink
+
+              // ---- coloured sprites (the crab): a big, FILLED coloured blob. Thin coloured strokes (our own overlay) never qualify.
+              private static final double SPRITE_AREA = 0.00025;    // x w^2: smallest area (the crab is about 0.0005)
+              private static final double SPRITE_MAX_AREA = 0.004;  // x w^2: largest area (anything bigger is a coloured background, not a sprite)
+              private static final double SPRITE_FILL = 0.4;        // share of its bounding box that must be filled (a ring or a line is far below this)
+              private static final double SPRITE_MIN_SIDE = 0.012;  // x w: both sides of the bounding box at least this long (the crab is about 0.02 x 0.03)
+              private static final int MAX_SPRITES = 8;
+
               private final int w, h;
               private final byte[] lum;
               private final boolean[] seen;
@@ -332,6 +351,13 @@ jobs:
               private final boolean[] gridHit;
               private final float[] gridDen;
               private final int[] gridQ;
+              private final int coreR;
+              private final byte[] cCls;
+              private final int[] cQ;
+              private final boolean[] cSeen;
+              private final int[] stDark = new int[3], stSolid = new int[3];
+              private final int[] spr = new int[MAX_SPRITES * 4];   // x0,y0,x1,y1 of each coloured sprite
+              private int sprN;
 
               public Detector(int w, int h) {
                   this.w = w;
@@ -347,6 +373,11 @@ jobs:
                   gridHit = new boolean[gw * gh];
                   gridDen = new float[gw * gh];
                   gridQ = new int[gw * gh];
+                  coreR = Math.max(6, Math.round((float) (CORE_R_FRAC * w)));
+                  int side = 2 * coreR + 1;
+                  cCls = new byte[side * side];
+                  cQ = new int[side * side];
+                  cSeen = new boolean[side * side];
               }
 
               private int lumAt(int i) { return lum[i] & 255; }
@@ -588,18 +619,129 @@ jobs:
                           }
                       }
                   }
+                  findColouredSprites();
                   float[] pts = new float[MAX_STARS * 2];
+                  float[] sizes = new float[MAX_STARS];
                   int count = 0;
                   int minCells = Math.max(3, Math.round(0.00004f * w * w / (step * step)));
                   int maxCells = Math.round(0.0045f * w * w / (step * step));
                   for (int i = 0; i < nc && count < MAX_STARS; i++) {
                       if (cn[i] < minCells || cn[i] > maxCells) continue;
+                      if (onColouredSprite(ccx[i], ccy[i])) continue;      // the crab (or another coloured sprite) is not a circle
+                      float mass = coreMass(res, ccx[i], ccy[i]);
+                      if (mass < 0) continue;                              // not a lattice of dots: points dot, score digit, crab ...
                       pts[count * 2] = (float) ccx[i];
                       pts[count * 2 + 1] = (float) ccy[i];
+                      sizes[count] = mass;
                       count++;
                   }
                   res.stars = pts;
+                  res.starSize = sizes;
                   res.starCount = count;
+              }
+
+              /** Finds every big filled coloured blob (the crab) once per frame. Our own overlay is only thin dots and thin rings, so it never counts. */
+              private void findColouredSprites() {
+                  sprN = 0;
+                  java.util.Arrays.fill(seen, false);
+                  int total = w * h;
+                  double minArea = SPRITE_AREA * w * (double) w, maxArea = SPRITE_MAX_AREA * w * (double) w;
+                  double minSide = SPRITE_MIN_SIDE * w;
+                  for (int s = 0; s < total && sprN < MAX_SPRITES; s++) {
+                      if (lumAt(s) != 255 || seen[s]) continue;
+                      int head = 0, tail = 0;
+                      int x0 = w, x1 = 0, y0 = h, y1 = 0;
+                      qa[tail++] = s;
+                      seen[s] = true;
+                      while (head < tail) {
+                          int p = qa[head++];
+                          int x = p % w, y = p / w, q;
+                          if (x < x0) x0 = x;
+                          if (x > x1) x1 = x;
+                          if (y < y0) y0 = y;
+                          if (y > y1) y1 = y;
+                          if (x > 0) { q = p - 1; if (!seen[q] && lumAt(q) == 255) { seen[q] = true; qa[tail++] = q; } }
+                          if (x < w - 1) { q = p + 1; if (!seen[q] && lumAt(q) == 255) { seen[q] = true; qa[tail++] = q; } }
+                          if (y > 0) { q = p - w; if (!seen[q] && lumAt(q) == 255) { seen[q] = true; qa[tail++] = q; } }
+                          if (y < h - 1) { q = p + w; if (!seen[q] && lumAt(q) == 255) { seen[q] = true; qa[tail++] = q; } }
+                      }
+                      int bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+                      if (tail < minArea || tail > maxArea) continue;
+                      if (Math.min(bw, bh) < minSide || tail < SPRITE_FILL * bw * bh) continue;
+                      spr[sprN * 4] = x0; spr[sprN * 4 + 1] = y0; spr[sprN * 4 + 2] = x1; spr[sprN * 4 + 3] = y1;
+                      sprN++;
+                  }
+              }
+
+              /** True if the point lies on (or just next to) a coloured sprite. */
+              private boolean onColouredSprite(double x, double y) {
+                  for (int i = 0; i < sprN; i++) {
+                      if (x >= spr[i * 4] - coreR && x <= spr[i * 4 + 2] + coreR
+                              && y >= spr[i * 4 + 1] - coreR && y <= spr[i * 4 + 3] + coreR) return true;
+                  }
+                  return false;
+              }
+
+              /**
+               * Looks at the pixels around a candidate and decides whether it is a real star core.
+               * Returns the amount of dark ink in the core (its size), or -1 if it is not a core.
+               *
+               * A core is a hexagonal lattice of ~10-40 small dots with light gaps between them. The things that
+               * fool a plain "how many dark pixels" test are all SOLID: the bold points dots between two circles and the
+               * dots of the score digits are single black discs, and the crab is one filled sprite.
+               * The sprite's own box is ignored, so a core right next to the sprite is not rejected because of it.
+               */
+              private float coreMass(Result res, double fcx, double fcy) {
+                  int cx = (int) Math.round(fcx), cy = (int) Math.round(fcy);
+                  int R = coreR, side = 2 * R + 1;
+                  int sx0 = res.bx0 - 2, sx1 = res.bx1 + 2, sy0 = res.by0 - 2, sy1 = res.by1 + 2;
+                  for (int j = 0; j < side; j++) {
+                      for (int i = 0; i < side; i++) {
+                          int k = j * side + i;
+                          cCls[k] = 0;
+                          int dx = i - R, dy = j - R;
+                          if (dx * dx + dy * dy > R * R) continue;
+                          int x = cx + dx, y = cy + dy;
+                          if (x < 0 || y < 0 || x >= w || y >= h) continue;
+                          if (x >= sx0 && x <= sx1 && y >= sy0 && y <= sy1) continue;      // the sprite itself
+                          int v = lumAt(y * w + x);
+                          if (v < VERY_DARK) cCls[k] = 2;           // solid ink
+                          else if (v < STAR_DARK) cCls[k] = 1;      // dark dot
+                      }
+                  }
+                  blobStats(side, 1, 2, stDark);
+                  blobStats(side, 2, 2, stSolid);
+                  double w2 = (double) w * w;
+                  if (stSolid[2] >= SOLID_FRAC * w2) return -1;         // one solid black disc (points dot, score dot, dark crab)
+                  if (stDark[0] < MIN_DOTS) return -1;                  // not enough separate dots to be a lattice
+                  if (stDark[2] > DOMINANT * stDark[1]) return -1;      // one blob holds most of the ink (faded crab, outline)
+                  return stDark[1];
+              }
+
+              /** Connected blobs (4-neighbour) among the window cells whose class is lo..hi: out = {count, total pixels, largest blob}. */
+              private void blobStats(int side, int lo, int hi, int[] out) {
+                  int total = side * side;
+                  java.util.Arrays.fill(cSeen, 0, total, false);
+                  int count = 0, sum = 0, largest = 0;
+                  for (int s = 0; s < total; s++) {
+                      int c = cCls[s];
+                      if (cSeen[s] || c < lo || c > hi) continue;
+                      int head = 0, tail = 0;
+                      cQ[tail++] = s;
+                      cSeen[s] = true;
+                      while (head < tail) {
+                          int p = cQ[head++];
+                          int px = p % side, py = p / side, q;
+                          if (px > 0) { q = p - 1; if (!cSeen[q] && cCls[q] >= lo && cCls[q] <= hi) { cSeen[q] = true; cQ[tail++] = q; } }
+                          if (px < side - 1) { q = p + 1; if (!cSeen[q] && cCls[q] >= lo && cCls[q] <= hi) { cSeen[q] = true; cQ[tail++] = q; } }
+                          if (py > 0) { q = p - side; if (!cSeen[q] && cCls[q] >= lo && cCls[q] <= hi) { cSeen[q] = true; cQ[tail++] = q; } }
+                          if (py < side - 1) { q = p + side; if (!cSeen[q] && cCls[q] >= lo && cCls[q] <= hi) { cSeen[q] = true; cQ[tail++] = q; } }
+                      }
+                      count++;
+                      sum += tail;
+                      if (tail > largest) largest = tail;
+                  }
+                  out[0] = count; out[1] = sum; out[2] = largest;
               }
           }
           AIMLINE_EOF
@@ -623,6 +765,8 @@ jobs:
            * (centroid of the whole sprite - very stable), never the facing angle.
            *
            * Between circles (flying) the heading is the direction the sprite is actually travelling.
+           *
+           * Target: of all the circles in front (above the one being orbited) the BIGGEST one is chosen, not the nearest.
            *
            * Tap time is solved, not guessed: from the fitted circle the engine computes the exact phase at
            * which leaving along the tangent passes through the middle of the next circle, converts it into a
@@ -684,6 +828,8 @@ jobs:
               private static final double VMIN = 0.12;        // flight speed (frame widths / s) above which velocity gives the heading
               private static final int CAP = 64;
               private static final double TURN_MIN = 8.5;       // radians of travel needed before auto-tap trusts a small or fast circle
+              private static final double SIZE_TIE = 0.90;      // circles within 10% of the biggest size count as equally big (then the nearer one wins)
+              private static final double KEEP_MARGIN = 1.20;   // the current target is kept unless another circle is more than 20% bigger
 
               private final int w;
               private final double r0;                         // typical orbit radius, only used as a size reference
@@ -1161,20 +1307,39 @@ jobs:
                   return Double.NaN;
               }
 
+              /** A circle is "in front" if it is above the circle being orbited and far enough away for a tangent to reach it. */
+              private boolean inFront(Detector.Result r, int j) {
+                  double sx = r.stars[2 * j], sy = r.stars[2 * j + 1];
+                  if (Math.hypot(sx - oCx, sy - oCy) < 1.12 * oR) return false;   // the star we are circling, or too close for a tangent to reach
+                  return sy <= oCy - 0.3 * oR;                                      // only circles above
+              }
+
               private void chooseTarget(double tc, long arrivalMs, Detector.Result r) {
                   locked = false;
                   if (!orbitActive || !haveFit) { targetKnown = false; return; }
-                  // the next circle = the nearest star above the one being circled
+                  // The circles in front = every real circle above the one being orbited (the detector has already thrown out the
+                  // crab, the bold points dots and the score digits). Jump only to the BIGGEST of them, not the nearest.
+                  double maxSize = -1;
+                  int cur = -1;
+                  double curD = 1e18;
+                  for (int j = 0; j < r.starCount; j++) {
+                      if (!inFront(r, j)) continue;
+                      if (r.starSize[j] > maxSize) maxSize = r.starSize[j];
+                      if (targetKnown) {                           // is this the circle that was already the target?
+                          double dc = Math.hypot(r.stars[2 * j] - tx, r.stars[2 * j + 1] - ty);
+                          if (dc < 0.3 * oR && dc < curD) { curD = dc; cur = j; }
+                      }
+                  }
+                  if (maxSize < 0) { targetKnown = false; return; }
                   int best = -1;
                   double bestD = 1e18;
                   for (int j = 0; j < r.starCount; j++) {
-                      double sx = r.stars[2 * j], sy = r.stars[2 * j + 1];
-                      double d = Math.hypot(sx - oCx, sy - oCy);
-                      if (d < 1.12 * oR) continue;                 // the star we are circling, or too close for a tangent to reach
-                      if (sy > oCy - 0.3 * oR) continue;           // only circles above
-                      if (d < bestD) { bestD = d; best = j; }
+                      if (!inFront(r, j) || r.starSize[j] < SIZE_TIE * maxSize) continue;
+                      double d = Math.hypot(r.stars[2 * j] - oCx, r.stars[2 * j + 1] - oCy);
+                      if (d < bestD) { bestD = d; best = j; }      // equally big circles: the nearer one
                   }
-                  if (best < 0) { targetKnown = false; return; }
+                  // sizes wobble a little from frame to frame: stay on the current target unless another circle is clearly bigger
+                  if (cur >= 0 && r.starSize[cur] * KEEP_MARGIN >= maxSize) best = cur;
                   double sx = r.stars[2 * best], sy = r.stars[2 * best + 1];
                   if (targetKnown && Math.hypot(sx - tx, sy - ty) < 0.3 * oR) {
                       tx += 0.3 * (sx - tx);
