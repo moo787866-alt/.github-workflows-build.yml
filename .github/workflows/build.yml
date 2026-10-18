@@ -39,8 +39,8 @@ jobs:
                   applicationId = "com.example.aimline"
                   minSdk = 30
                   targetSdk = 34
-                  versionCode = 5
-                  versionName = "3.1"
+                  versionCode = 6
+                  versionName = "3.2"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -140,7 +140,7 @@ jobs:
                   }
 
                   col.addView(TextView(this).apply {
-                      text = "Aim Line v3.1"
+                      text = "Aim Line v3.2"
                       textSize = 20f
                   })
 
@@ -292,6 +292,10 @@ jobs:
            * Finds (1) the player sprite: the largest solid near-black blob, its centre, and which way
            * it faces, and (2) the star cores (dense clusters of dark dots) used as targets.
            *
+           * The game has a white theme and a dark theme (everything's brightness swapped). Each frame the most common
+           * brightness (= the background) is checked; in the dark theme the brightness of every pixel is flipped first,
+           * so all the logic below only ever sees the white theme. In the white theme nothing is changed.
+           *
            * Facing is the principal axis of the whole filled sprite shape (uses every pixel, so it is
            * stable), with the 180 degree ambiguity resolved by where the white iris ring sits.
            */
@@ -301,6 +305,7 @@ jobs:
                   public float x, y;            // sprite centre (frame px)
                   public float angle;           // facing direction, radians (y axis points down)
                   public boolean confident;     // facing sign was decided by the iris ring
+                  public boolean inverted;      // this frame was in the dark theme (brightness was flipped before analysis)
                   public float tip;             // distance from centre to the nose along the facing direction
                   public int bx0, by0, bx1, by1;
                   public float[] stars = new float[0];   // x0,y0,x1,y1,...
@@ -346,16 +351,54 @@ jobs:
 
               private int lumAt(int i) { return lum[i] & 255; }
 
+              // ---- theme (background brightness) tracking
+              private final int[] hist = new int[16];
+              private boolean inverted, polarityKnown;
+              private int flips;
+
+              /** The most common brightness is the background: light = white theme, dark = dark theme. */
+              private void decidePolarity() {
+                  int best = 0, total = 0;
+                  for (int b = 0; b < 16; b++) {
+                      total += hist[b];
+                      if (hist[b] > hist[best]) best = b;
+                  }
+                  if (total < 200) return;                           // nothing to judge from (e.g. a fully coloured screen): keep the last answer
+                  boolean wantInverted = best < 8;
+                  if (!polarityKnown) { inverted = wantInverted; polarityKnown = true; flips = 0; return; }
+                  if (wantInverted == inverted) { flips = 0; return; }
+                  // a clear change (background is at least half of the screen) switches at once, an unclear one must repeat
+                  if (hist[best] * 2 >= total || ++flips >= 3) { inverted = wantInverted; flips = 0; }
+              }
+
               public Result detect(byte[] px, int stride) {
+                  java.util.Arrays.fill(hist, 0);
                   for (int y = 0; y < h; y++) {
                       int o = y * stride;
                       int row = y * w;
+                      boolean sampleRow = (y & 3) == 0;
                       for (int x = 0; x < w; x++) {
                           int r = px[o] & 255, g = px[o + 1] & 255, b = px[o + 2] & 255;
                           int mx = Math.max(r, Math.max(g, b));
                           int mn = Math.min(r, Math.min(g, b));
-                          lum[row + x] = (mx - mn > COLOR_LIMIT) ? (byte) 255 : (byte) (((r + g + b) * 85) >> 8);
+                          int v;
+                          if (mx - mn > COLOR_LIMIT) {
+                              v = 255;                                  // coloured (our own overlay): always "not dark"
+                          } else {
+                              v = ((r + g + b) * 85) >> 8;              // 0..254, so 255 is only ever the coloured marker
+                              if (sampleRow && (x & 3) == 0) hist[v >> 4]++;
+                          }
+                          lum[row + x] = (byte) v;
                           o += 4;
+                      }
+                  }
+                  decidePolarity();
+                  if (inverted) {
+                      // dark theme: flip brightness so that the sprite is dark and the background light, like the white theme
+                      int all = w * h;
+                      for (int i = 0; i < all; i++) {
+                          int v = lum[i] & 255;
+                          if (v != 255) lum[i] = (byte) (254 - v);
                       }
                   }
 
@@ -467,6 +510,7 @@ jobs:
                   res.confident = confident;
                   res.tip = (float) (sign > 0 ? maxPlus : maxMinus);
                   res.bx0 = x0; res.by0 = y0; res.bx1 = x1; res.by1 = y1;
+                  res.inverted = inverted;
 
                   findStars(res);
                   return res;
@@ -639,6 +683,7 @@ jobs:
               private static final double WINDOW_MS = 1000;
               private static final double VMIN = 0.12;        // flight speed (frame widths / s) above which velocity gives the heading
               private static final int CAP = 64;
+              private static final double TURN_MIN = 8.5;       // radians of travel needed before auto-tap trusts a small or fast circle
 
               private final int w;
               private final double r0;                         // typical orbit radius, only used as a size reference
@@ -659,6 +704,10 @@ jobs:
               // ---- orbit session
               private boolean orbitActive, haveFit, centreFromPath;
               private double pathSince = -1;
+              private boolean pathSeeded;                      // orbit was found from the sprite's own path (no star needed)
+              private final double[] ft = new double[CAP], fx = new double[CAP], fy = new double[CAP];
+              private int fn;
+              private static final int[] SEED_K = {8, 10, 13, 17, 22, 28, 36, 46, 58};
               private int runCount, missCount;
               private double runX, runY, runDist, orbitStartT;
               private double ocx, ocy;                         // detected centre of the star being circled
@@ -721,7 +770,13 @@ jobs:
                   track(dt, r);
                   tLast = tc;
                   tSeen = tc;
-                  if (orbitActive) followOrbit(tc, r); else seekOrbit(tc, r);
+                  addFree(tc, r.x, r.y);
+                  if (orbitActive) {
+                      followOrbit(tc, r);
+                  } else {
+                      seekOrbit(tc, r);
+                      if (!orbitActive) seekByPath(tc);
+                  }
                   chooseTarget(tc, arrivalMs, r);
                   return snapshot();
               }
@@ -812,7 +867,8 @@ jobs:
                       double phi = oPhi + oOm * (tc - oT) / 1000.0;
                       double err = Math.hypot(r.x - (oCx + oR * Math.cos(phi)), r.y - (oCy + oR * Math.sin(phi)));
                       double dist = Math.hypot(r.x - oCx, r.y - oCy);
-                      bad = err > 0.12 * oR || Math.abs(dist - oR) > 0.2 * oR;
+                      double floor = 0.008 * w;
+                      bad = err > Math.max(0.12 * oR, floor) || Math.abs(dist - oR) > Math.max(0.2 * oR, floor);
                   } else {
                       double dist = Math.hypot(r.x - ocx, r.y - ocy);
                       bad = dist < 0.5 * oR || dist > 1.7 * oR;
@@ -829,7 +885,7 @@ jobs:
                       double d = Math.hypot(r.stars[2 * i] - ocx, r.stars[2 * i + 1] - ocy);
                       if (d < bd) { bd = d; bi = i; }
                   }
-                  if (bi >= 0) {
+                  if (bi >= 0 && !pathSeeded) {
                       ocx += 0.1 * (r.stars[2 * bi] - ocx);
                       ocy += 0.1 * (r.stars[2 * bi + 1] - ocy);
                   }
@@ -846,6 +902,8 @@ jobs:
                   haveFit = false;
                   centreFromPath = false;
                   pathSince = -1;
+                  pathSeeded = false;
+                  fn = 0;
                   runCount = 0;
                   missCount = 0;
                   n = 0;
@@ -886,7 +944,7 @@ jobs:
                       span += wrap(a - prev);
                       prev = a;
                   }
-                  if (Math.abs(span) > 1.6 && circleFit(cf)) {
+                  if (Math.abs(span) > 1.6 && circleFit(bx, by, 0, n, cf)) {
                       double md = meanDist(cx, cy);
                       if (Math.hypot(cf[0] - ocx, cf[1] - ocy) < 0.45 * md && cf[2] > 0.6 * md && cf[2] < 1.4 * md) {
                           cx = cf[0];
@@ -895,6 +953,7 @@ jobs:
                       }
                   }
 
+                  double rLimit = Math.max(0.12, 2.0 / Math.max(8.0, meanDist(cx, cy)));    // pixel noise matters more on small circles
                   double prevA = 0;
                   for (int i = 0; i < n; i++) {
                       double a = Math.atan2(by[i] - cy, bx[i] - cx);
@@ -927,11 +986,11 @@ jobs:
                               double res = tphi[i] - (icpt + slope * (bt[i] - tc) / 1000.0);
                               if (Math.abs(res) > thr) keep[i] = false;
                           }
-                      } else if (rms > 0.12) {
+                      } else if (rms > rLimit) {
                           return;
                       }
                   }
-                  if (Math.abs(slope) < 1.2 || Math.abs(slope) > 10) return;
+                  if (Math.abs(slope) < 1.2 || Math.abs(slope) > 25) return;
                   double rs = 0;
                   int rc = 0;
                   for (int i = 0; i < n; i++) {
@@ -941,7 +1000,7 @@ jobs:
                   }
                   if (rc < 5) return;
                   double R = rs / rc;
-                  if (R < 0.5 * r0 || R > 2.0 * r0) return;
+                  if (R < 0.02 * w || R > 2.0 * r0) return;
 
                   double phiNow = wrap(icpt);
                   boolean reset = !haveFit || (slope > 0) != (oOm > 0);
@@ -964,14 +1023,82 @@ jobs:
                   }
               }
 
-              /** Algebraic least-squares circle through the stored sprite positions. out = {cx, cy, radius}. */
-              private boolean circleFit(double[] out) {
+              /** Remember the sprite's recent positions, whether or not a circle is known. */
+              private void addFree(double tc, double px, double py) {
+                  if (fn > 0 && tc - ft[fn - 1] > 120) fn = 0;                 // a gap in the frames: start again
+                  int drop = 0;
+                  while (drop < fn && tc - ft[drop] > WINDOW_MS) drop++;
+                  if (fn - drop >= CAP) drop = fn - CAP + 1;
+                  if (drop > 0) {
+                      System.arraycopy(ft, drop, ft, 0, fn - drop);
+                      System.arraycopy(fx, drop, fx, 0, fn - drop);
+                      System.arraycopy(fy, drop, fy, 0, fn - drop);
+                      fn -= drop;
+                  }
+                  ft[fn] = tc; fx[fn] = px; fy[fn] = py;
+                  fn++;
+              }
+
+              /**
+               * Finds an orbit from the sprite's own path: the recent positions lie on a circle and go round it steadily.
+               * No star is needed, so small circles (where the star is hidden next to the sprite) work too.
+               */
+              private boolean seekByPath(double tc) {
+                  double rMin = 0.02 * w, rMax = 2.0 * r0;
+                  for (int k : SEED_K) {
+                      if (k > fn) break;
+                      int off = fn - k;
+                      if (ft[fn - 1] - ft[off] < 250) continue;
+                      if (!circleFit(fx, fy, off, k, cf)) continue;
+                      double cx = cf[0], cy = cf[1], R = cf[2];
+                      if (R < rMin || R > rMax) continue;
+                      double ss = 0;
+                      for (int i = off; i < fn; i++) {
+                          double d = Math.hypot(fx[i] - cx, fy[i] - cy) - R;
+                          ss += d * d;
+                      }
+                      if (Math.sqrt(ss / k) > Math.max(0.08 * R, 0.004 * w)) continue;      // not a circle
+                      double prev = Math.atan2(fy[off] - cy, fx[off] - cx), acc = 0;
+                      int up = 0, down = 0;
+                      for (int i = off + 1; i < fn; i++) {
+                          double a = Math.atan2(fy[i] - cy, fx[i] - cx);
+                          double d = wrap(a - prev);
+                          prev = a;
+                          acc += d;
+                          if (d > 0) up++; else down++;
+                      }
+                      double om = acc / ((ft[fn - 1] - ft[off]) / 1000.0);
+                      if (Math.abs(acc) < 1.2 || Math.abs(om) < 1.2 || Math.abs(om) > 25) continue;   // too short an arc, or too slow / fast
+                      if (Math.min(up, down) > 0.15 * (k - 1)) continue;                              // not going round steadily
+                      // try the full fit on these samples first; only a circle that really fits becomes the orbit
+                      haveFit = false;
+                      centreFromPath = false;
+                      ocx = cx; ocy = cy; oR = R;
+                      orbitStartT = ft[off];
+                      n = k;
+                      System.arraycopy(ft, off, bt, 0, k);
+                      System.arraycopy(fx, off, bx, 0, k);
+                      System.arraycopy(fy, off, by, 0, k);
+                      fit(tc);
+                      if (haveFit) {
+                          orbitActive = true;
+                          pathSeeded = true;
+                          missCount = 0;
+                          return true;
+                      }
+                      n = 0;
+                  }
+                  return false;
+              }
+
+              /** Algebraic least-squares circle through cnt points of (ax, ay) starting at off. out = {cx, cy, radius}. */
+              private static boolean circleFit(double[] ax, double[] ay, int off, int cnt, double[] out) {
                   double mx = 0, my = 0;
-                  for (int i = 0; i < n; i++) { mx += bx[i]; my += by[i]; }
-                  mx /= n; my /= n;
+                  for (int i = off; i < off + cnt; i++) { mx += ax[i]; my += ay[i]; }
+                  mx /= cnt; my /= cnt;
                   double suu = 0, svv = 0, suv = 0, suuu = 0, svvv = 0, suvv = 0, svuu = 0;
-                  for (int i = 0; i < n; i++) {
-                      double u = bx[i] - mx, v = by[i] - my;
+                  for (int i = off; i < off + cnt; i++) {
+                      double u = ax[i] - mx, v = ay[i] - my;
                       suu += u * u; svv += v * v; suv += u * v;
                       suuu += u * u * u; svvv += v * v * v; suvv += u * v * v; svuu += v * u * u;
                   }
@@ -982,7 +1109,7 @@ jobs:
                   double vc = (suu * b2 - suv * b1) / det;
                   out[0] = mx + uc;
                   out[1] = my + vc;
-                  out[2] = Math.sqrt(uc * uc + vc * vc + (suu + svv) / n);
+                  out[2] = Math.sqrt(uc * uc + vc * vc + (suu + svv) / cnt);
                   return true;
               }
 
@@ -1066,6 +1193,8 @@ jobs:
                   // only tap once the circle comes from the sprite's own path (not just the star centre) and has settled
                   if (centreFromPath) { if (pathSince < 0) pathSince = tc; } else pathSince = -1;
                   boolean steady = pathSince >= 0 && tc - pathSince > 150 && n >= 8 && clockFrames > 45;
+                  // a small or fast circle needs a full turn of data first: an error in its centre or speed is magnified there
+                  if ((oR < 0.7 * r0 || Math.abs(oOm) > 6) && Math.abs(oOm) * (tc - orbitStartT) / 1000.0 < TURN_MIN) steady = false;
                   double tAt = tRel - tapLeadMs;
                   double inMs = tAt - arrivalMs;
                   // a tap that would be more than a hair late waits for the next pass instead of landing off-line
